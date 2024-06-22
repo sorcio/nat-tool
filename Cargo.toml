@@ -13,6 +13,8 @@ description = "Control port mappings for a gateway compatible with NAT-PMP"
 clap = { version = "4.1.8", features = ["derive", "env"] }
 miette = { version = "5.6.0", features = ["fancy-no-backtrace"] }
 nat-pmp-client = { path = "nat-pmp-client" }
+netdev = "0.29.0"
+thiserror = "1.0.61"
 
 [profile.release]
 codegen-units = 1

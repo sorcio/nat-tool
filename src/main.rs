@@ -1,17 +1,19 @@
+mod default_gw;
+
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use miette::{IntoDiagnostic, Result};
+use miette::{Context, IntoDiagnostic, Result};
 
 use nat_pmp_client::{Lifetime, NatPmpClient, Protocol};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// NAT-PMP gateway IP address
+    /// NAT-PMP gateway IP address (if not specified, try to use the default gateway)
     #[arg(short, long, env)]
-    gateway: Ipv4Addr,
+    gateway: Option<Ipv4Addr>,
     /// Use this port instead of the NAT-PMP default
     #[arg(short, long, default_value_t = 5351)]
     port: u16,
@@ -21,7 +23,14 @@ struct Cli {
 
 impl Cli {
     fn make_client(&self) -> Result<NatPmpClient> {
-        NatPmpClient::new(self.gateway, self.port).into_diagnostic()
+        let gateway = if let Some(gateway) = self.gateway {
+            gateway
+        } else {
+            default_gw::get_default_gateway()
+                .into_diagnostic()
+                .wrap_err("no gateway was provided, and no default gateway could be found")?
+        };
+        NatPmpClient::new(gateway, self.port).into_diagnostic()
     }
 }
 
