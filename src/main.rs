@@ -1,12 +1,10 @@
-mod client;
-
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, Result};
 
-use client::*;
+use nat_pmp_client::{Lifetime, NatPmpClient, Protocol};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

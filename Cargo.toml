@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "nat-pmp-client"]
+
 [package]
 name = "nat-tool"
 version = "0.1.0"
@@ -9,8 +12,7 @@ description = "Control port mappings for a gateway compatible with NAT-PMP"
 [dependencies]
 clap = { version = "4.1.8", features = ["derive", "env"] }
 miette = { version = "5.6.0", features = ["fancy-no-backtrace"] }
-parking_lot = "0.12.1"
-thiserror = "1.0.39"
+nat-pmp-client = { path = "nat-pmp-client" }
 
 [profile.release]
 codegen-units = 1

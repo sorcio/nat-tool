@@ -10,18 +10,18 @@ use thiserror::Error;
 type Result<T> = std::result::Result<T, NatPmpError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Lifetime(u32);
+pub struct Lifetime(u32);
 
 impl Lifetime {
-    pub(crate) const fn from_secs(secs: u32) -> Self {
+    pub const fn from_secs(secs: u32) -> Self {
         Lifetime(secs)
     }
 
-    pub(crate) const fn duration(self) -> Duration {
+    pub const fn duration(self) -> Duration {
         Duration::from_secs(self.0 as _)
     }
 
-    pub(crate) const fn to_be_bytes(self) -> [u8; 4] {
+    pub const fn to_be_bytes(self) -> [u8; 4] {
         self.0.to_be_bytes()
     }
 }
@@ -71,7 +71,7 @@ impl ResponseHeader {
 #[repr(u16)]
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
-pub(crate) enum ResultCode {
+pub enum ResultCode {
     /// Success
     Success = 0,
     /// Unsupported Version
@@ -139,14 +139,14 @@ impl NatPmpRequest for ExternalAddressRequest {
 }
 
 #[repr(C, packed)]
-pub(crate) struct ExternalAddressResponse {
+pub struct ExternalAddressResponse {
     ip: [u8; 4],
 }
 
 impl NatPmpResponse for ExternalAddressResponse {}
 
 impl ExternalAddressResponse {
-    pub(crate) fn ip(&self) -> Ipv4Addr {
+    pub fn ip(&self) -> Ipv4Addr {
         Ipv4Addr::from(self.ip)
     }
 }
@@ -167,13 +167,13 @@ impl NatPmpRequest for MapPortRequest {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum Protocol {
+pub enum Protocol {
     Udp = 1,
     Tcp = 2,
 }
 
 impl MapPortRequest {
-    pub(crate) fn new(
+    pub fn new(
         internal_port: u16,
         external_port: u16,
         protocol: Protocol,
@@ -195,7 +195,7 @@ impl MapPortRequest {
 }
 
 #[repr(C, packed)]
-pub(crate) struct MapPortResponse {
+pub struct MapPortResponse {
     internal_port_be: [u8; 2],
     external_port_be: [u8; 2],
     lifetime_be: [u8; 4],
@@ -204,22 +204,22 @@ pub(crate) struct MapPortResponse {
 impl NatPmpResponse for MapPortResponse {}
 
 impl MapPortResponse {
-    pub(crate) fn internal_port(&self) -> u16 {
+    pub fn internal_port(&self) -> u16 {
         u16::from_be_bytes(self.internal_port_be)
     }
 
-    pub(crate) fn external_port(&self) -> u16 {
+    pub fn external_port(&self) -> u16 {
         u16::from_be_bytes(self.external_port_be)
     }
 
-    pub(crate) fn lifetime(&self) -> Lifetime {
+    pub fn lifetime(&self) -> Lifetime {
         let secs = u32::from_be_bytes(self.lifetime_be);
         Lifetime::from_secs(secs as _)
     }
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum NatPmpError {
+pub enum NatPmpError {
     #[error("socket error")]
     SocketError(#[from] std::io::Error),
     #[error("NAT gateway sent an invalid response")]
@@ -232,12 +232,12 @@ pub(crate) enum NatPmpError {
     UnknownResultCode(u16),
 }
 
-pub(crate) struct NatPmpClient {
+pub struct NatPmpClient {
     socket: Mutex<UdpSocket>,
 }
 
 impl NatPmpClient {
-    pub(crate) fn new(gateway: Ipv4Addr, port: u16) -> Result<Self> {
+    pub fn new(gateway: Ipv4Addr, port: u16) -> Result<Self> {
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
         let gw_addr = SocketAddrV4::new(gateway, port);
         socket.connect(gw_addr)?;
@@ -301,12 +301,12 @@ impl NatPmpClient {
         Err(NatPmpError::ResponseTimeout.into())
     }
 
-    pub(crate) fn external_address(&self) -> Result<ExternalAddressResponse> {
+    pub fn external_address(&self) -> Result<ExternalAddressResponse> {
         let s = self.socket.lock();
         self.do_request(&s, &ExternalAddressRequest::new())
     }
 
-    pub(crate) fn map_port(
+    pub fn map_port(
         &self,
         internal_port: u16,
         external_port: u16,

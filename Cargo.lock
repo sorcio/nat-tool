@@ -197,13 +197,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nat-pmp-client"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "thiserror",
+]
+
+[[package]]
 name = "nat-tool"
 version = "0.1.0"
 dependencies = [
  "clap",
  "miette",
- "parking_lot",
- "thiserror",
+ "nat-pmp-client",
 ]
 
 [[package]]
