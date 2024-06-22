@@ -1,0 +1,19 @@
+[package]
+name = "nat-tool"
+version = "0.1.0"
+edition = "2021"
+description = "Control port mappings for a gateway compatible with NAT-PMP"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { version = "4.1.8", features = ["derive", "env"] }
+miette = { version = "5.6.0", features = ["fancy-no-backtrace"] }
+parking_lot = "0.12.1"
+thiserror = "1.0.39"
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+lto = true
+strip = "debuginfo"
