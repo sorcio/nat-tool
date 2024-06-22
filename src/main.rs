@@ -97,8 +97,8 @@ fn map_port(cli: &Cli, map_port_args: &MapPortArgs) -> Result<()> {
             println!(
                 "{:?} public port {} -> private port {} ({})",
                 protocol,
-                map_port_result.private_port(),
                 map_port_result.public_port(),
+                map_port_result.private_port(),
                 map_port_result.lifetime(),
             );
             least_lifetime = map_port_result.lifetime().duration().min(least_lifetime);
