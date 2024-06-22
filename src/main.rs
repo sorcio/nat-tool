@@ -41,9 +41,9 @@ struct MapPortArgs {
     #[arg(short, long, value_enum, default_value_t = PortType::Both)]
     protocol: PortType,
     /// the external port number (0 to auto-select, if supported)
-    public_port: u16,
+    external_port: u16,
     /// the internal port number (0 to auto-select, if supported)
-    private_port: u16,
+    internal_port: u16,
     /// how long should the mapping stay open (in seconds)
     #[arg(short, long, default_value_t = Lifetime::from_secs(60))]
     lifetime: Lifetime,
@@ -75,8 +75,8 @@ impl PortType {
 fn external_address(cli: &Cli) -> Result<()> {
     let client = cli.make_client()?;
 
-    let public_address = client.public_address().into_diagnostic()?;
-    println!("public address: {}", public_address.ip());
+    let external_address = client.external_address().into_diagnostic()?;
+    println!("external address: {}", external_address.ip());
     Ok(())
 }
 
@@ -88,17 +88,17 @@ fn map_port(cli: &Cli, map_port_args: &MapPortArgs) -> Result<()> {
         for protocol in map_port_args.protocol.protocols() {
             let map_port_result = client
                 .map_port(
-                    map_port_args.private_port,
-                    map_port_args.public_port,
+                    map_port_args.internal_port,
+                    map_port_args.external_port,
                     *protocol,
                     map_port_args.lifetime,
                 )
                 .into_diagnostic()?;
             println!(
-                "{:?} public port {} -> private port {} ({})",
+                "{:?} external port {} -> internal port {} ({})",
                 protocol,
-                map_port_result.public_port(),
-                map_port_result.private_port(),
+                map_port_result.external_port(),
+                map_port_result.internal_port(),
                 map_port_result.lifetime(),
             );
             least_lifetime = map_port_result.lifetime().duration().min(least_lifetime);

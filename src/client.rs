@@ -9,7 +9,6 @@ use thiserror::Error;
 
 type Result<T> = std::result::Result<T, NatPmpError>;
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Lifetime(u32);
 
@@ -41,7 +40,6 @@ impl std::fmt::Display for Lifetime {
         write!(f, "{}s", self.0)
     }
 }
-
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
@@ -118,14 +116,14 @@ trait NatPmpResponse: Sized {
 }
 
 #[repr(C, packed)]
-struct PublicAddressRequest {
+struct ExternalAddressRequest {
     version: u8,
     opcode: u8,
-    reserved: u16, // PCP compatibility hack
+    reserved: u16,  // PCP compatibility hack
     reserved2: u32, // PCP compatibility hack
 }
 
-impl PublicAddressRequest {
+impl ExternalAddressRequest {
     fn new() -> Self {
         Self {
             version: 0,
@@ -136,18 +134,18 @@ impl PublicAddressRequest {
     }
 }
 
-impl NatPmpRequest for PublicAddressRequest {
-    type Response = PublicAddressResponse;
+impl NatPmpRequest for ExternalAddressRequest {
+    type Response = ExternalAddressResponse;
 }
 
 #[repr(C, packed)]
-pub(crate) struct PublicAddressResponse {
+pub(crate) struct ExternalAddressResponse {
     ip: [u8; 4],
 }
 
-impl NatPmpResponse for PublicAddressResponse {}
+impl NatPmpResponse for ExternalAddressResponse {}
 
-impl PublicAddressResponse {
+impl ExternalAddressResponse {
     pub(crate) fn ip(&self) -> Ipv4Addr {
         Ipv4Addr::from(self.ip)
     }
@@ -158,8 +156,8 @@ struct MapPortRequest {
     version: u8,
     opcode: u8,
     reserved: u16,
-    private_port_be: [u8; 2],
-    public_port_be: [u8; 2],
+    internal_port_be: [u8; 2],
+    external_port_be: [u8; 2],
     lifetime_be: [u8; 4],
 }
 
@@ -176,21 +174,21 @@ pub(crate) enum Protocol {
 
 impl MapPortRequest {
     pub(crate) fn new(
-        private_port: u16,
-        public_port: u16,
+        internal_port: u16,
+        external_port: u16,
         protocol: Protocol,
         lifetime: Lifetime,
     ) -> Self {
-        let private_port_be = private_port.to_be_bytes();
-        let public_port_be = public_port.to_be_bytes();
+        let internal_port_be = internal_port.to_be_bytes();
+        let external_port_be = external_port.to_be_bytes();
         let lifetime_be = lifetime.to_be_bytes();
         let opcode = protocol as _;
         MapPortRequest {
             version: 0,
             opcode,
             reserved: 0,
-            private_port_be,
-            public_port_be,
+            internal_port_be,
+            external_port_be,
             lifetime_be,
         }
     }
@@ -198,20 +196,20 @@ impl MapPortRequest {
 
 #[repr(C, packed)]
 pub(crate) struct MapPortResponse {
-    private_port_be: [u8; 2],
-    public_port_be: [u8; 2],
+    internal_port_be: [u8; 2],
+    external_port_be: [u8; 2],
     lifetime_be: [u8; 4],
 }
 
 impl NatPmpResponse for MapPortResponse {}
 
 impl MapPortResponse {
-    pub(crate) fn private_port(&self) -> u16 {
-        u16::from_be_bytes(self.private_port_be)
+    pub(crate) fn internal_port(&self) -> u16 {
+        u16::from_be_bytes(self.internal_port_be)
     }
 
-    pub(crate) fn public_port(&self) -> u16 {
-        u16::from_be_bytes(self.public_port_be)
+    pub(crate) fn external_port(&self) -> u16 {
+        u16::from_be_bytes(self.external_port_be)
     }
 
     pub(crate) fn lifetime(&self) -> Lifetime {
@@ -296,29 +294,27 @@ impl NatPmpClient {
                     ErrorKind::WouldBlock | ErrorKind::TimedOut => {
                         timeout *= 2;
                     }
-                    _ => {
-                        return Err(err.into())
-                    }
+                    _ => return Err(err.into()),
                 },
             }
         }
         Err(NatPmpError::ResponseTimeout.into())
     }
 
-    pub(crate) fn public_address(&self) -> Result<PublicAddressResponse> {
+    pub(crate) fn external_address(&self) -> Result<ExternalAddressResponse> {
         let s = self.socket.lock();
-        self.do_request(&s, &PublicAddressRequest::new())
+        self.do_request(&s, &ExternalAddressRequest::new())
     }
 
     pub(crate) fn map_port(
         &self,
-        private_port: u16,
-        public_port: u16,
+        internal_port: u16,
+        external_port: u16,
         protocol: Protocol,
         lifetime: Lifetime,
     ) -> Result<MapPortResponse> {
         let s = self.socket.lock();
-        let map_port = MapPortRequest::new(private_port, public_port, protocol, lifetime);
+        let map_port = MapPortRequest::new(internal_port, external_port, protocol, lifetime);
         self.do_request(&s, &map_port)
     }
 }
