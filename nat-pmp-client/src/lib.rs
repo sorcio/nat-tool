@@ -78,10 +78,23 @@ pub enum NatPmpError {
     BadResponse,
     #[error("no response from gateway within timeout")]
     ResponseTimeout,
-    #[error("gateway refused the operation: {0:?}")]
+    #[error("gateway refused the operation: {}", .0.error_message())]
     ProtocolError(ResultCode),
     #[error("gateway responded with an unknown result code: {0}")]
     UnknownResultCode(u16),
+}
+
+impl ResultCode {
+    fn error_message(self) -> &'static str {
+        match self {
+            ResultCode::Success => "success",
+            ResultCode::UnsupportedVersion => "unsupported version",
+            ResultCode::NotAuthorized => "not authorized",
+            ResultCode::NetworkFailure => "network failure",
+            ResultCode::OutOfResources => "out of resources",
+            ResultCode::UnsupportedOpcode => "unsupported opcode",
+        }
+    }
 }
 
 pub struct NatPmpClient {
@@ -117,26 +130,31 @@ impl NatPmpClient {
     }
 
     fn parse_response<Response: NatPmpResponse>(&self, data: &[u8]) -> Result<Response> {
-        if data.len() == ResponseHeader::SIZE {
-            // Some gateways (likely supporting PCP) can send empty error
-            // response packet, with no payload. When that is the case, we can
-            // still parse the response header to get the result code.
-            let header = ResponseHeader::read_from(data).ok_or(NatPmpError::BadResponse)?;
-            let result_code = header.result()?;
-            Err(if !result_code.is_success() {
-                NatPmpError::ProtocolError(result_code)
-            } else {
-                // no error code, but no payload either, so we can't make no sense of it
-                NatPmpError::BadResponse
-            })
-        } else {
-            let packet = ResponsePacket::read_from(data).ok_or(NatPmpError::BadResponse)?;
+        if let Some(packet) = ResponsePacket::read_from(data) {
             let result_code = packet.header().result()?;
             if !result_code.is_success() {
                 return Err(NatPmpError::ProtocolError(result_code));
             }
             // TODO check opcode, ...
             Ok(packet.into_payload())
+        } else {
+            // Some gateways that support both NAT-PMP and PCP don't respect
+            // version negotiation and send a response which is not a valid NAT-PMP
+            // response. We do our best to handle that gracefully.
+            let header = ResponseHeader::read_from(&data[..ResponseHeader::SIZE])
+                .ok_or(NatPmpError::BadResponse)?;
+            if header.version().is_err() {
+                return Err(NatPmpError::BadResponse);
+            }
+            // In the best case, the gateway sent a response with an error code
+            // and no payload. In that case, we can still report the error.
+            let result_code = header.result()?;
+            Err(if !result_code.is_success() {
+                NatPmpError::ProtocolError(result_code)
+            } else {
+                // no error code, but no valid payload either, so we can make no sense of it
+                NatPmpError::BadResponse
+            })
         }
     }
 

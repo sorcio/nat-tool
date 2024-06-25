@@ -58,7 +58,9 @@ struct MapPortArgs {
     /// automatically repeat the request when lifetime is about to expire
     #[arg(short, long, default_value_t = false)]
     repeat: bool,
-    /// output the external address every time the mapping is refreshed
+    /// monitor external address changes and report them
+    /// (only works with the `repeat` option)
+    #[arg(short, long, default_value_t = false)]
     external_address: bool,
     /// how to format the output
     #[arg(short, long, default_value_t = OutputFormat::Text)]
