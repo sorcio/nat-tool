@@ -1,11 +1,22 @@
+#![deny(unsafe_code)]
+#![deny(unreachable_pub)]
+
+mod packets;
+
 use std::fmt::Debug;
 use std::io::ErrorKind;
-use std::mem::size_of;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::Duration;
 
+use packets::{
+    ExternalAddressRequest, ExternalAddressResponse, MapPortRequest, MapPortResponse,
+    ResponseHeader, ResponsePacket,
+};
 use parking_lot::Mutex;
 use thiserror::Error;
+
+pub use packets::{Protocol, ResultCode};
+use zerocopy::{AsBytes, FromBytes};
 
 type Result<T> = std::result::Result<T, NatPmpError>;
 
@@ -41,182 +52,23 @@ impl std::fmt::Display for Lifetime {
     }
 }
 
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-struct ResponseHeader {
-    version: u8,
-    opcode: u8,
-    result_be: [u8; 2],
-    ts_be: [u8; 4],
-}
-
-impl ResponseHeader {
-    #[allow(dead_code)]
-    fn timestamp(&self) -> Lifetime {
-        let secs = u32::from_be_bytes(self.ts_be);
-        Lifetime::from_secs(secs as _)
-    }
-
-    fn result(&self) -> Result<ResultCode> {
-        let raw_code = u16::from_be_bytes(self.result_be);
-        let max = ResultCode::MAX as u16;
-        if raw_code < max {
-            Ok(unsafe { std::mem::transmute(raw_code) })
-        } else {
-            Err(NatPmpError::UnknownResultCode(raw_code).into())
-        }
-    }
-}
-
-#[repr(u16)]
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub enum ResultCode {
-    /// Success
-    Success = 0,
-    /// Unsupported Version
-    UnsupportedVersion = 1,
-    /// Not Authorized/Refused (e.g. box supports mapping, but user has turned feature off)
-    NotAuthorized = 2,
-    /// Network Failure (e.g. NAT box itself has not obtained a DHCP lease)
-    NetworkFailure = 3,
-    /// Out of resources (NAT box cannot create any more mappings at this time)
-    OutOfResource = 4,
-    /// Unsupported opcode
-    UnsupportedOpcode = 5,
-    /// (this is only a marker, don't use)
-    MAX,
-}
-
-impl ResultCode {
-    fn is_success(&self) -> bool {
-        matches!(self, Self::Success)
-    }
-}
-
-trait NatPmpRequest: Sized {
-    const SIZE: usize = size_of::<Self>();
-
+trait NatPmpRequest: AsBytes {
     type Response: NatPmpResponse;
-
-    fn as_bytes(&self) -> &[u8] {
-        let data = self as *const Self;
-        unsafe { std::slice::from_raw_parts(data as _, Self::SIZE) }
-    }
 }
 
-trait NatPmpResponse: Sized {
-    const SIZE: usize = size_of::<Self>();
-
-    unsafe fn from_bytes(bytes: &[u8]) -> Self {
-        debug_assert_eq!(bytes.len(), Self::SIZE);
-        let ptr = bytes.as_ptr() as *const Self;
-        unsafe { ptr.read() }
-    }
-}
-
-#[repr(C, packed)]
-struct ExternalAddressRequest {
-    version: u8,
-    opcode: u8,
-    reserved: u16,  // PCP compatibility hack
-    reserved2: u32, // PCP compatibility hack
-}
-
-impl ExternalAddressRequest {
-    fn new() -> Self {
-        Self {
-            version: 0,
-            opcode: 0,
-            reserved: 0,
-            reserved2: 0,
-        }
-    }
-}
+trait NatPmpResponse: FromBytes {}
 
 impl NatPmpRequest for ExternalAddressRequest {
     type Response = ExternalAddressResponse;
 }
 
-#[repr(C, packed)]
-pub struct ExternalAddressResponse {
-    ip: [u8; 4],
-}
-
 impl NatPmpResponse for ExternalAddressResponse {}
-
-impl ExternalAddressResponse {
-    pub fn ip(&self) -> Ipv4Addr {
-        Ipv4Addr::from(self.ip)
-    }
-}
-
-#[repr(C, packed)]
-struct MapPortRequest {
-    version: u8,
-    opcode: u8,
-    reserved: u16,
-    internal_port_be: [u8; 2],
-    external_port_be: [u8; 2],
-    lifetime_be: [u8; 4],
-}
 
 impl NatPmpRequest for MapPortRequest {
     type Response = MapPortResponse;
 }
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy)]
-pub enum Protocol {
-    Udp = 1,
-    Tcp = 2,
-}
-
-impl MapPortRequest {
-    pub fn new(
-        internal_port: u16,
-        external_port: u16,
-        protocol: Protocol,
-        lifetime: Lifetime,
-    ) -> Self {
-        let internal_port_be = internal_port.to_be_bytes();
-        let external_port_be = external_port.to_be_bytes();
-        let lifetime_be = lifetime.to_be_bytes();
-        let opcode = protocol as _;
-        MapPortRequest {
-            version: 0,
-            opcode,
-            reserved: 0,
-            internal_port_be,
-            external_port_be,
-            lifetime_be,
-        }
-    }
-}
-
-#[repr(C, packed)]
-pub struct MapPortResponse {
-    internal_port_be: [u8; 2],
-    external_port_be: [u8; 2],
-    lifetime_be: [u8; 4],
-}
-
 impl NatPmpResponse for MapPortResponse {}
-
-impl MapPortResponse {
-    pub fn internal_port(&self) -> u16 {
-        u16::from_be_bytes(self.internal_port_be)
-    }
-
-    pub fn external_port(&self) -> u16 {
-        u16::from_be_bytes(self.external_port_be)
-    }
-
-    pub fn lifetime(&self) -> Lifetime {
-        let secs = u32::from_be_bytes(self.lifetime_be);
-        Lifetime::from_secs(secs as _)
-    }
-}
 
 #[derive(Debug, Error)]
 pub enum NatPmpError {
@@ -236,6 +88,24 @@ pub struct NatPmpClient {
     socket: Mutex<UdpSocket>,
 }
 
+pub struct PortMapping {
+    pub internal_port: u16,
+    pub external_port: u16,
+    pub protocol: Protocol,
+    pub lifetime: Lifetime,
+}
+
+impl PortMapping {
+    fn from_response(protocol: Protocol, response: &MapPortResponse) -> Self {
+        Self {
+            internal_port: response.internal_port(),
+            external_port: response.external_port(),
+            protocol,
+            lifetime: response.lifetime(),
+        }
+    }
+}
+
 impl NatPmpClient {
     pub fn new(gateway: Ipv4Addr, port: u16) -> Result<Self> {
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
@@ -246,26 +116,28 @@ impl NatPmpClient {
         })
     }
 
-    fn parse_response<Response: NatPmpResponse>(
-        &self,
-        size: usize,
-        data: &[u8],
-    ) -> Result<Response> {
-        const HEADER_SIZE: usize = size_of::<ResponseHeader>();
-        if size < HEADER_SIZE {
-            return Err(NatPmpError::BadResponse.into());
+    fn parse_response<Response: NatPmpResponse>(&self, data: &[u8]) -> Result<Response> {
+        if data.len() == ResponseHeader::SIZE {
+            // Some gateways (likely supporting PCP) can send empty error
+            // response packet, with no payload. When that is the case, we can
+            // still parse the response header to get the result code.
+            let header = ResponseHeader::read_from(data).ok_or(NatPmpError::BadResponse)?;
+            let result_code = header.result()?;
+            Err(if !result_code.is_success() {
+                NatPmpError::ProtocolError(result_code)
+            } else {
+                // no error code, but no payload either, so we can't make no sense of it
+                NatPmpError::BadResponse
+            })
+        } else {
+            let packet = ResponsePacket::read_from(data).ok_or(NatPmpError::BadResponse)?;
+            let result_code = packet.header().result()?;
+            if !result_code.is_success() {
+                return Err(NatPmpError::ProtocolError(result_code));
+            }
+            // TODO check opcode, ...
+            Ok(packet.into_payload())
         }
-        let header = unsafe { (data.as_ptr() as *const ResponseHeader).read() };
-        let result_code = header.result()?;
-        if !result_code.is_success() {
-            return Err(NatPmpError::ProtocolError(result_code).into());
-        }
-        // TODO check opcode, ...
-        let msg = &data[HEADER_SIZE..];
-        if msg.len() < Response::SIZE {
-            return Err(NatPmpError::BadResponse.into());
-        }
-        return Ok(unsafe { Response::from_bytes(&msg[..Response::SIZE]) });
     }
 
     fn do_request<Request, Response>(&self, s: &UdpSocket, request: &Request) -> Result<Response>
@@ -287,7 +159,7 @@ impl NatPmpClient {
 
             match recv_result {
                 Ok(size) => {
-                    let response = self.parse_response(size, &buf)?;
+                    let response = self.parse_response(&buf[..size])?;
                     return Ok(response);
                 }
                 Err(err) => match err.kind() {
@@ -298,7 +170,7 @@ impl NatPmpClient {
                 },
             }
         }
-        Err(NatPmpError::ResponseTimeout.into())
+        Err(NatPmpError::ResponseTimeout)
     }
 
     pub fn external_address(&self) -> Result<ExternalAddressResponse> {
@@ -312,9 +184,10 @@ impl NatPmpClient {
         external_port: u16,
         protocol: Protocol,
         lifetime: Lifetime,
-    ) -> Result<MapPortResponse> {
+    ) -> Result<PortMapping> {
         let s = self.socket.lock();
         let map_port = MapPortRequest::new(internal_port, external_port, protocol, lifetime);
-        self.do_request(&s, &map_port)
+        let response = self.do_request(&s, &map_port)?;
+        Ok(PortMapping::from_response(protocol, &response))
     }
 }

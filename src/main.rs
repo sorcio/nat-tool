@@ -136,7 +136,7 @@ fn map_port(cli: &Cli, map_port_args: &MapPortArgs) -> Result<()> {
                 )
                 .into_diagnostic()?;
 
-            least_lifetime = map_port_result.lifetime().duration().min(least_lifetime);
+            least_lifetime = map_port_result.lifetime.duration().min(least_lifetime);
             let notification = output::NatPmpNotification::from_response(
                 protocol,
                 map_port_result,

@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 
-use nat_pmp_client::{Lifetime, MapPortResponse, Protocol};
+use nat_pmp_client::{Lifetime, PortMapping, Protocol};
 
 use crate::OutputFormat;
 
@@ -26,13 +26,13 @@ pub(crate) struct NatPmpNotification {
 impl NatPmpNotification {
     pub(crate) fn from_response(
         protocol: Protocol,
-        response: MapPortResponse,
+        response: PortMapping,
         external_address: Option<Ipv4Addr>,
     ) -> Self {
         NatPmpNotification {
-            internal_port: response.internal_port(),
-            external_port: response.external_port(),
-            lifetime: response.lifetime(),
+            internal_port: response.internal_port,
+            external_port: response.external_port,
+            lifetime: response.lifetime,
             protocol,
             external_address,
         }

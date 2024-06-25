@@ -6,3 +6,5 @@ edition = "2021"
 [dependencies]
 parking_lot = "0.12.1"
 thiserror = "1.0.61"
+zerocopy = "0.7.34"
+zerocopy-derive = "0.7.34"
