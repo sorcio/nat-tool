@@ -151,17 +151,6 @@ fn map_port(cli: &Cli, map_port_args: &MapPortArgs) -> Result<()> {
     tracing::info!("starting map_port");
     let client = cli.make_client()?;
     loop {
-        // let external_address = if map_port_args.external_address {
-        //     Some(
-        //         client
-        //             .external_address()
-        //             .map(|addr| addr.ip())
-        //             .into_diagnostic()
-        //             .wrap_err("cannot get external address")?,
-        //     )
-        // } else {
-        //     None
-        // };
         let mut least_lifetime = Duration::MAX;
         let mut requests = vec![];
         if map_port_args.external_address {
@@ -196,27 +185,11 @@ fn map_port(cli: &Cli, map_port_args: &MapPortArgs) -> Result<()> {
                     );
                     println!("{}", notification.format(map_port_args.format));
                 }
-                _ => {}
+                _ => {
+                    tracing::debug!(?response, "unexpected response");
+                }
             }
         }
-        // for &protocol in map_port_args.protocol.protocols() {
-        //     let map_port_result = client
-        //         .map_port(
-        //             map_port_args.internal_port,
-        //             map_port_args.external_port,
-        //             protocol,
-        //             map_port_args.lifetime,
-        //         )
-        //         .into_diagnostic()?;
-
-        //     least_lifetime = map_port_result.lifetime.duration().min(least_lifetime);
-        //     let notification = output::NatPmpNotification::from_response(
-        //         protocol,
-        //         map_port_result,
-        //         external_address,
-        //     );
-        //     println!("{}", notification.format(map_port_args.format));
-        // }
         if !map_port_args.repeat {
             break;
         }

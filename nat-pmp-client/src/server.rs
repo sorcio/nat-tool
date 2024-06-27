@@ -87,28 +87,38 @@ impl PortRange {
         }
     }
 
-    pub fn contains(&self, port: u16) -> bool {
+    pub const fn contains(&self, port: u16) -> bool {
         port >= self.start && port <= (self.start - 1) + self.length
     }
 
-    pub fn len(&self) -> u16 {
+    pub const fn len(&self) -> u16 {
         self.length
     }
 
-    pub fn start(&self) -> u16 {
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+
+    pub const fn start(&self) -> u16 {
         self.start
     }
 
-    pub fn end(&self) -> u16 {
+    pub const fn end(&self) -> u16 {
         (self.start - 1) + self.length
     }
 
-    pub fn starting_at(self, start: u16) -> Option<Self> {
+    pub const fn starting_at(self, start: u16) -> Option<Self> {
         if start == 0 {
             return None;
         }
-        let end = start.checked_add(self.length - 1)?;
-        Self::checked_new(start, end)
+        if start.checked_add(self.length - 1).is_some() {
+            Some(Self {
+                start,
+                length: self.length,
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -306,7 +316,6 @@ impl Server {
             Opcode::GetExternalAddress => {
                 tracing::info!("external address request");
                 respond(self.process_external_address_request(response).as_bytes());
-                return;
             }
             Opcode::MapUdpPort | Opcode::MapTcpPort => {
                 let Some(request) =
