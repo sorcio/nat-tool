@@ -1,0 +1,517 @@
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::io::ErrorKind;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::time::{Duration, Instant};
+
+use crate::packets::{
+    ExternalAddressRequest, ExternalAddressResponse, MapPortRequest, MapPortResponse, Opcode,
+    ValidatedResponseHeader, Version,
+};
+use crate::{Lifetime, NatPmpError, PortMapping, Protocol, RequestError};
+
+use parking_lot::Mutex;
+use tracing::instrument;
+use zerocopy::{AsBytes, FromBytes};
+
+#[derive(Debug)]
+pub enum Request {
+    ExternalAddress,
+    MapPort {
+        internal_port: u16,
+        external_port: u16,
+        protocol: Protocol,
+        lifetime: Lifetime,
+    },
+}
+
+impl Request {
+    fn check_compatibility(&self, other: &Request) -> Result<(), NatPmpError> {
+        match (self, other) {
+            (
+                Request::MapPort {
+                    protocol,
+                    internal_port,
+                    external_port,
+                    ..
+                },
+                Request::MapPort {
+                    protocol: other_protocol,
+                    internal_port: other_internal_port,
+                    external_port: other_external_port,
+                    ..
+                },
+            ) if protocol == other_protocol
+                && internal_port == other_internal_port
+                && external_port != other_external_port =>
+            {
+                Err(NatPmpError::ConflictingMappingPending {
+                    protocol: *protocol,
+                    internal_port: *internal_port,
+                    external_port: *external_port,
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn key(&self) -> RequestKey {
+        match self {
+            Request::ExternalAddress => RequestKey::GetExternalAddress,
+            Request::MapPort {
+                protocol: Protocol::Udp,
+                internal_port,
+                ..
+            } => RequestKey::MapUdpPort(*internal_port),
+            Request::MapPort {
+                protocol: Protocol::Tcp,
+                internal_port,
+                ..
+            } => RequestKey::MapTcpPort(*internal_port),
+        }
+    }
+
+    fn as_bytes(&self) -> Vec<u8> {
+        match self {
+            Request::ExternalAddress => ExternalAddressRequest::new().as_bytes().to_vec(),
+            Request::MapPort {
+                internal_port,
+                external_port,
+                protocol,
+                lifetime,
+            } => MapPortRequest::new(*internal_port, *external_port, *protocol, *lifetime)
+                .as_bytes()
+                .to_vec(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RequestState {
+    request: Request,
+    time: Instant,
+    attempts: u8,
+    response: Option<Response>,
+    wakers: Vec<std::task::Waker>,
+}
+
+enum ShouldSend {
+    No,
+    Now,
+    Later(Instant),
+}
+
+impl RequestState {
+    fn new(request: Request, time: Instant) -> Self {
+        Self {
+            request,
+            time,
+            attempts: 0,
+            response: None,
+            wakers: Vec::new(),
+        }
+    }
+
+    fn should_send(&self, now: Instant) -> ShouldSend {
+        const MAX_ATTEMPTS: u8 = 10;
+        const BASIC_DELAY: Duration = Duration::from_millis(250);
+        if self.response.is_some() || self.attempts >= MAX_ATTEMPTS {
+            ShouldSend::No
+        } else if self.attempts == 0 {
+            ShouldSend::Now
+        } else {
+            // Exponential backoff: start with 250 ms, then double each time
+            let next_attempt = self.time + BASIC_DELAY * 2u32.pow(self.attempts as u32);
+            if now >= next_attempt {
+                ShouldSend::Now
+            } else {
+                ShouldSend::Later(next_attempt)
+            }
+        }
+    }
+
+    fn increment_attempts(&mut self) {
+        self.attempts += 1;
+    }
+
+    fn set_response(&mut self, response: Result<ResponseData, NatPmpError>, now: Instant) {
+        tracing::trace!(?response, "Setting response");
+        debug_assert!(
+            self.response.is_none(),
+            "response already set to {:?}, cannot set to {response:?}",
+            self.response
+        );
+        self.response = Some(Response {
+            time: now,
+            data: response,
+        });
+        for waker in self.wakers.drain(..) {
+            waker.wake();
+        }
+    }
+
+    fn as_bytes(&self) -> Vec<u8> {
+        self.request.as_bytes()
+    }
+
+    fn register_waker(&mut self, waker: std::task::Waker) {
+        self.wakers.push(waker);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ResponseData {
+    ExternalAddress(ExternalAddressResponse),
+    MapPort(PortMapping),
+}
+
+#[derive(Debug, Clone)]
+pub struct Response {
+    time: Instant,
+    data: Result<ResponseData, NatPmpError>,
+}
+
+impl Response {
+    pub fn data(&self) -> Result<&ResponseData, NatPmpError> {
+        self.data.as_ref().map_err(|e| e.clone())
+    }
+
+    pub fn time(&self) -> Instant {
+        self.time
+    }
+}
+
+pub struct ResponseFuture<'client> {
+    client: &'client NonblockingClient,
+    key: RequestKey,
+}
+
+impl<'client> ResponseFuture<'client> {
+    fn new(client: &'client NonblockingClient, key: RequestKey) -> Self {
+        Self { client, key }
+    }
+
+    fn poll_response(&self) -> Option<Response> {
+        self.client
+            .pending_requests
+            .lock()
+            .get(&self.key)
+            .and_then(|request| request.response.clone())
+    }
+}
+
+impl<'client> core::future::Future for ResponseFuture<'client> {
+    type Output = Response;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if let Some(request) = self.client.pending_requests.lock().get_mut(&self.key) {
+            if let Some(response) = &request.response {
+                std::task::Poll::Ready(response.clone())
+            } else {
+                request.register_waker(cx.waker().clone());
+                std::task::Poll::Pending
+            }
+        } else {
+            // Not supposed to happen, but should be safe to return Pending
+            std::task::Poll::Pending
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RequestKey {
+    GetExternalAddress,
+    MapUdpPort(u16),
+    MapTcpPort(u16),
+}
+
+impl RequestKey {
+    fn soft_match_opcode(self, opcode: Opcode) -> bool {
+        match self {
+            RequestKey::GetExternalAddress => opcode == Opcode::GetExternalAddress,
+            RequestKey::MapUdpPort(_) => opcode == Opcode::MapUdpPort,
+            RequestKey::MapTcpPort(_) => opcode == Opcode::MapTcpPort,
+        }
+    }
+}
+
+pub trait TimeSource {
+    fn now(&self) -> Instant;
+}
+
+#[derive(Debug)]
+struct SystemTimeSource;
+
+impl TimeSource for SystemTimeSource {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+pub struct NonblockingClient {
+    time_source: Box<dyn TimeSource>,
+    pending_requests: Mutex<HashMap<RequestKey, RequestState>>,
+}
+
+impl core::fmt::Debug for NonblockingClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NonblockingClient")
+            .field("pending_requests", &self.pending_requests)
+            .finish()
+    }
+}
+
+impl Default for NonblockingClient {
+    fn default() -> Self {
+        Self::new(Box::new(SystemTimeSource) as _)
+    }
+}
+
+impl NonblockingClient {
+    pub fn new(time_source: Box<dyn TimeSource>) -> Self {
+        Self {
+            time_source,
+            pending_requests: Default::default(),
+        }
+    }
+
+    pub fn request(&self, request: Request) -> Result<ResponseFuture, NatPmpError> {
+        let key = request.key();
+        match self.pending_requests.lock().entry(key) {
+            Entry::Occupied(entry) => {
+                let existing_request = entry.get();
+                existing_request.request.check_compatibility(&request)?;
+            }
+            Entry::Vacant(entry) => {
+                let pending_request = RequestState::new(request, self.time_source.now());
+                entry.insert(pending_request);
+            }
+        }
+        let future = ResponseFuture::new(self, key);
+        Ok(future)
+    }
+
+    pub fn external_address(&self) -> Result<ResponseFuture, NatPmpError> {
+        // convenience method
+        self.request(Request::ExternalAddress)
+    }
+
+    pub fn map_port(
+        &self,
+        protocol: Protocol,
+        external_port: u16,
+        internal_port: u16,
+        lifetime: Lifetime,
+    ) -> Result<ResponseFuture, NatPmpError> {
+        // convenience method
+        self.request(Request::MapPort {
+            protocol,
+            external_port,
+            internal_port,
+            lifetime,
+        })
+    }
+
+    #[instrument(skip_all, level = "trace")]
+    fn parse_packet(&self, _source: Ipv4Addr, data: &[u8]) {
+        let Some((header, payload)) = ValidatedResponseHeader::checked_from_bytes(data) else {
+            tracing::trace!("Invalid response header");
+            return;
+        };
+        if header.version() != Version::NatPmp {
+            // TODO: log error
+        }
+        let opcode = header.opcode();
+        let mut pending_requests = self.pending_requests.lock();
+        let now = self.time_source.now();
+        match opcode {
+            Opcode::GetExternalAddress => {
+                let key = RequestKey::GetExternalAddress;
+                let mut entry = {
+                    match pending_requests.entry(key) {
+                        Entry::Occupied(entry) => entry,
+                        Entry::Vacant(_) => {
+                            // no matching request
+                            return;
+                        }
+                    }
+                };
+                let result = header.result();
+                if !result.is_success() {
+                    entry
+                        .get_mut()
+                        .set_response(Err(NatPmpError::ProtocolError(result)), now);
+                } else if let Some(response) = ExternalAddressResponse::read_from(payload) {
+                    entry
+                        .get_mut()
+                        .set_response(Ok(ResponseData::ExternalAddress(response)), now);
+                } else {
+                    // invalid response
+                    entry
+                        .get_mut()
+                        .set_response(Err(NatPmpError::BadResponse), now);
+                }
+            }
+            Opcode::MapUdpPort | Opcode::MapTcpPort => {
+                // some extra dance steps to get around non-compliant servers
+                // and *try* to send a response to the right request even in
+                // error cases where the response is missing the payload which
+                // would allow us to identify the request
+                if let Some(response) = MapPortResponse::read_from(payload) {
+                    // easy case: we have a parsable response
+                    let internal_port = response.internal_port();
+                    let key = match opcode {
+                        Opcode::MapUdpPort => RequestKey::MapUdpPort(internal_port),
+                        Opcode::MapTcpPort => RequestKey::MapTcpPort(internal_port),
+                        _ => unreachable!(),
+                    };
+                    let protocol = match opcode {
+                        Opcode::MapUdpPort => Protocol::Udp,
+                        Opcode::MapTcpPort => Protocol::Tcp,
+                        _ => unreachable!(),
+                    };
+                    let mut entry = {
+                        match pending_requests.entry(key) {
+                            Entry::Occupied(entry) => entry,
+                            Entry::Vacant(_) => {
+                                // no matching request
+                                return;
+                            }
+                        }
+                    };
+                    let result = header.result();
+                    if !result.is_success() {
+                        entry
+                            .get_mut()
+                            .set_response(Err(NatPmpError::ProtocolError(result)), now);
+                        return;
+                    }
+                    entry.get_mut().set_response(
+                        Ok(ResponseData::MapPort(PortMapping::from_response(
+                            protocol, &response,
+                        ))),
+                        now,
+                    );
+                } else {
+                    // Invalid or missing payload. We would like to report an
+                    // error to the requester, but we can't in general because
+                    // we don't have the internal port number to identify the
+                    // request. But a common case is that only one request is
+                    // pending at a time, so we can just try to find it.
+                    tracing::trace!("Missing or invalid payload in response");
+                    let matching_requests = pending_requests
+                        .iter_mut()
+                        .filter(|(key, _)| key.soft_match_opcode(opcode))
+                        .map(|(_, request)| request)
+                        .take(2)
+                        .collect::<Vec<_>>();
+                    if matching_requests.len() != 1 {
+                        // no matching request, or multiple matching requests
+                        // which we can't disambiguate so we just discard the
+                        // packet and let the request time out
+                        return;
+                    }
+                    let request = matching_requests.into_iter().next().unwrap();
+                    let result = header.result();
+                    request.set_response(Err(NatPmpError::ProtocolError(result)), now);
+                }
+            }
+        };
+    }
+
+    fn send_outgoing(&self) -> (Vec<Vec<u8>>, Option<Instant>) {
+        let mut requests = self.pending_requests.lock();
+        let mut next_deadline = None;
+        let now = self.time_source.now();
+        let mut outgoing_packets = vec![];
+        for (_, request) in requests.iter_mut() {
+            match request.should_send(now) {
+                ShouldSend::No => (),
+                ShouldSend::Now => {
+                    tracing::info!(?request, "sending request");
+                    let data = request.as_bytes();
+                    request.increment_attempts();
+                    outgoing_packets.push(data);
+                }
+                ShouldSend::Later(deadline) => {
+                    next_deadline =
+                        Some(next_deadline.map_or(deadline, |d: Instant| d.min(deadline)));
+                }
+            }
+        }
+        (outgoing_packets, next_deadline)
+    }
+}
+
+#[instrument(skip_all)]
+pub fn blocking_requests(
+    socket: &UdpSocket,
+    requests: impl IntoIterator<Item = Request>,
+) -> Result<Vec<Response>, RequestError> {
+    tracing::info!("sending blocking requests");
+    let client = NonblockingClient::default();
+    let futures: Vec<_> = requests
+        .into_iter()
+        .inspect(|request| tracing::info!(?request))
+        .map(|request| client.request(request))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let (outgoing, mut next_deadline) = client.send_outgoing();
+    for data in outgoing {
+        socket.send(&data)?;
+    }
+
+    let mut buf = [0; 1024];
+    loop {
+        loop {
+            if let Some(next_deadline) = next_deadline {
+                let now = Instant::now();
+                let timeout = next_deadline - now;
+                socket.set_read_timeout(Some(timeout))?;
+            }
+            match socket.recv_from(&mut buf) {
+                Ok((size, sock_addr)) => {
+                    let data = &buf[..size];
+                    tracing::trace!(?sock_addr, ?data, "received packet");
+                    let source = ipv4_addr_from_socket_addr(&sock_addr, Ipv4Addr::UNSPECIFIED);
+                    client.parse_packet(source, data);
+                    if let Some(responses) = futures
+                        .iter()
+                        .map(|f| f.poll_response())
+                        .collect::<Option<Vec<_>>>()
+                    {
+                        tracing::trace!(?responses, "responses ready");
+                        return Ok(responses);
+                    }
+                }
+                Err(err) => match err.kind() {
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+                        tracing::trace!("no packet received yet");
+                        break;
+                    }
+                    _ => return Err(err.into()),
+                },
+            }
+        }
+
+        let (outgoing, deadline) = client.send_outgoing();
+        for data in outgoing {
+            socket.send(&data)?;
+        }
+        if deadline.is_some() {
+            next_deadline = deadline;
+        } else {
+            return Err(NatPmpError::ResponseTimeout.into());
+        }
+    }
+}
+
+fn ipv4_addr_from_socket_addr(addr: &SocketAddr, default: Ipv4Addr) -> Ipv4Addr {
+    match addr {
+        SocketAddr::V4(v4) => *v4.ip(),
+        _ => default,
+    }
+}

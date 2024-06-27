@@ -1,5 +1,7 @@
 mod default_gw;
 mod output;
+#[cfg(feature = "server")]
+mod server;
 
 use std::time::Duration;
 use std::{fmt::Display, net::Ipv4Addr};
@@ -7,7 +9,11 @@ use std::{fmt::Display, net::Ipv4Addr};
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{Context, IntoDiagnostic, Result};
 
-use nat_pmp_client::{Lifetime, NatPmpClient, Protocol};
+#[cfg(feature = "server")]
+use nat_pmp_client::server::TestServerOptions;
+use nat_pmp_client::{nonblocking, Lifetime, NatPmpClient, Protocol};
+use tracing::Level;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -33,6 +39,26 @@ impl Cli {
         };
         NatPmpClient::new(gateway, self.port).into_diagnostic()
     }
+
+    #[cfg(feature = "server")]
+    fn make_server_config(&self) -> Result<TestServerOptions> {
+        use std::net::SocketAddrV4;
+
+        let Commands::Server(server_args) = &self.command else {
+            panic!("make_server_config called with non-Server command");
+        };
+
+        use nat_pmp_client::server::TestServerOptionsBuilder;
+
+        let ip = self.gateway.unwrap_or(Ipv4Addr::UNSPECIFIED);
+        let port = self.port;
+        let bind_address = SocketAddrV4::new(ip, port);
+        let mut options = TestServerOptionsBuilder::default();
+        options.bind_address(bind_address);
+        options.external_address(server_args.external_address.into_option());
+        options.port_ranges(server_args.port_mappings.clone());
+        Ok(options.build().unwrap())
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -41,6 +67,9 @@ enum Commands {
     ExternalAddress,
     /// Map an external (or public) port to an internal (or private) port.
     MapPort(MapPortArgs),
+    /// Run a fake NAT-PMP server (for testing)
+    #[cfg(feature = "server")]
+    Server(server::ServerArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -113,39 +142,81 @@ fn external_address(cli: &Cli) -> Result<()> {
 }
 
 fn map_port(cli: &Cli, map_port_args: &MapPortArgs) -> Result<()> {
+    tracing_subscriber::fmt::fmt()
+        .with_span_events(FmtSpan::FULL)
+        .with_max_level(Level::TRACE)
+        .compact()
+        .init();
+
+    tracing::info!("starting map_port");
     let client = cli.make_client()?;
-
     loop {
-        let external_address = if map_port_args.external_address {
-            Some(
-                client
-                    .external_address()
-                    .map(|addr| addr.ip())
-                    .into_diagnostic()
-                    .wrap_err("cannot get external address")?,
-            )
-        } else {
-            None
-        };
+        // let external_address = if map_port_args.external_address {
+        //     Some(
+        //         client
+        //             .external_address()
+        //             .map(|addr| addr.ip())
+        //             .into_diagnostic()
+        //             .wrap_err("cannot get external address")?,
+        //     )
+        // } else {
+        //     None
+        // };
         let mut least_lifetime = Duration::MAX;
-        for &protocol in map_port_args.protocol.protocols() {
-            let map_port_result = client
-                .map_port(
-                    map_port_args.internal_port,
-                    map_port_args.external_port,
-                    protocol,
-                    map_port_args.lifetime,
-                )
-                .into_diagnostic()?;
-
-            least_lifetime = map_port_result.lifetime.duration().min(least_lifetime);
-            let notification = output::NatPmpNotification::from_response(
-                protocol,
-                map_port_result,
-                external_address,
-            );
-            println!("{}", notification.format(map_port_args.format));
+        let mut requests = vec![];
+        if map_port_args.external_address {
+            requests.push(nonblocking::Request::ExternalAddress);
         }
+        requests.extend(map_port_args.protocol.protocols().iter().map(|&protocol| {
+            nonblocking::Request::MapPort {
+                internal_port: map_port_args.internal_port,
+                external_port: map_port_args.external_port,
+                protocol,
+                lifetime: map_port_args.lifetime,
+            }
+        }));
+        let responses = client
+            ._nonblocking_but_blocking_requests(requests)
+            .into_diagnostic()
+            .wrap_err("cannot send request to NAT-PMP gateway")?;
+
+        let external_address = responses.iter().find_map(|response| match response.data() {
+            Ok(nonblocking::ResponseData::ExternalAddress(result)) => Some(result.ip()),
+            _ => None,
+        });
+        tracing::debug!("external address: {:?}", external_address);
+        for response in responses {
+            match response.data().into_diagnostic()? {
+                nonblocking::ResponseData::MapPort(result) => {
+                    least_lifetime = result.lifetime.duration().min(least_lifetime);
+                    let notification = output::NatPmpNotification::from_response(
+                        result.protocol,
+                        result.clone(),
+                        external_address,
+                    );
+                    println!("{}", notification.format(map_port_args.format));
+                }
+                _ => {}
+            }
+        }
+        // for &protocol in map_port_args.protocol.protocols() {
+        //     let map_port_result = client
+        //         .map_port(
+        //             map_port_args.internal_port,
+        //             map_port_args.external_port,
+        //             protocol,
+        //             map_port_args.lifetime,
+        //         )
+        //         .into_diagnostic()?;
+
+        //     least_lifetime = map_port_result.lifetime.duration().min(least_lifetime);
+        //     let notification = output::NatPmpNotification::from_response(
+        //         protocol,
+        //         map_port_result,
+        //         external_address,
+        //     );
+        //     println!("{}", notification.format(map_port_args.format));
+        // }
         if !map_port_args.repeat {
             break;
         }
@@ -160,5 +231,7 @@ fn main() -> Result<()> {
     match &cli.command {
         Commands::ExternalAddress => external_address(&cli),
         Commands::MapPort(map_port_args) => map_port(&cli, map_port_args),
+        #[cfg(feature = "server")]
+        Commands::Server(server_args) => server::run_server(&cli, server_args),
     }
 }

@@ -1,7 +1,10 @@
 #![deny(unsafe_code)]
 #![deny(unreachable_pub)]
 
+pub mod nonblocking;
 mod packets;
+#[cfg(feature = "server")]
+pub mod server;
 
 use std::fmt::Debug;
 use std::io::ErrorKind;
@@ -18,12 +21,14 @@ use thiserror::Error;
 pub use packets::{Protocol, ResultCode};
 use zerocopy::{AsBytes, FromBytes};
 
-type Result<T> = std::result::Result<T, NatPmpError>;
+// type Result<T> = std::result::Result<T, NatPmpError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Lifetime(u32);
 
 impl Lifetime {
+    const ZERO: Self = Self(0);
+
     pub const fn from_secs(secs: u32) -> Self {
         Lifetime(secs)
     }
@@ -43,6 +48,14 @@ impl std::str::FromStr for Lifetime {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let s = s.strip_suffix('s').unwrap_or(s);
         Ok(Self(u32::from_str(s)?))
+    }
+}
+
+impl TryFrom<Duration> for Lifetime {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(value: Duration) -> Result<Self, Self::Error> {
+        Ok(Self(value.as_secs().try_into()?))
     }
 }
 
@@ -71,9 +84,15 @@ impl NatPmpRequest for MapPortRequest {
 impl NatPmpResponse for MapPortResponse {}
 
 #[derive(Debug, Error)]
-pub enum NatPmpError {
+pub enum RequestError {
     #[error("socket error")]
     SocketError(#[from] std::io::Error),
+    #[error(transparent)]
+    NatPmpError(#[from] NatPmpError),
+}
+
+#[derive(Debug, Error, Clone)]
+pub enum NatPmpError {
     #[error("NAT gateway sent an invalid response")]
     BadResponse,
     #[error("no response from gateway within timeout")]
@@ -82,6 +101,12 @@ pub enum NatPmpError {
     ProtocolError(ResultCode),
     #[error("gateway responded with an unknown result code: {0}")]
     UnknownResultCode(u16),
+    #[error("the internal port {internal_port} ({protocol:?}) is already pending mapping to external port {external_port}")]
+    ConflictingMappingPending {
+        protocol: Protocol,
+        internal_port: u16,
+        external_port: u16,
+    },
 }
 
 impl ResultCode {
@@ -101,6 +126,7 @@ pub struct NatPmpClient {
     socket: Mutex<UdpSocket>,
 }
 
+#[derive(Debug, Clone)]
 pub struct PortMapping {
     pub internal_port: u16,
     pub external_port: u16,
@@ -120,7 +146,7 @@ impl PortMapping {
 }
 
 impl NatPmpClient {
-    pub fn new(gateway: Ipv4Addr, port: u16) -> Result<Self> {
+    pub fn new(gateway: Ipv4Addr, port: u16) -> Result<Self, std::io::Error> {
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
         let gw_addr = SocketAddrV4::new(gateway, port);
         socket.connect(gw_addr)?;
@@ -129,7 +155,10 @@ impl NatPmpClient {
         })
     }
 
-    fn parse_response<Response: NatPmpResponse>(&self, data: &[u8]) -> Result<Response> {
+    fn parse_response<Response: NatPmpResponse>(
+        &self,
+        data: &[u8],
+    ) -> Result<Response, NatPmpError> {
         if let Some(packet) = ResponsePacket::read_from(data) {
             let result_code = packet.header().result()?;
             if !result_code.is_success() {
@@ -158,7 +187,11 @@ impl NatPmpClient {
         }
     }
 
-    fn do_request<Request, Response>(&self, s: &UdpSocket, request: &Request) -> Result<Response>
+    fn do_request<Request, Response>(
+        &self,
+        s: &UdpSocket,
+        request: &Request,
+    ) -> Result<Response, RequestError>
     where
         Request: NatPmpRequest<Response = Response>,
         Response: NatPmpResponse,
@@ -188,10 +221,10 @@ impl NatPmpClient {
                 },
             }
         }
-        Err(NatPmpError::ResponseTimeout)
+        Err(NatPmpError::ResponseTimeout.into())
     }
 
-    pub fn external_address(&self) -> Result<ExternalAddressResponse> {
+    pub fn external_address(&self) -> Result<ExternalAddressResponse, RequestError> {
         let s = self.socket.lock();
         self.do_request(&s, &ExternalAddressRequest::new())
     }
@@ -202,10 +235,18 @@ impl NatPmpClient {
         external_port: u16,
         protocol: Protocol,
         lifetime: Lifetime,
-    ) -> Result<PortMapping> {
+    ) -> Result<PortMapping, RequestError> {
         let s = self.socket.lock();
         let map_port = MapPortRequest::new(internal_port, external_port, protocol, lifetime);
         let response = self.do_request(&s, &map_port)?;
         Ok(PortMapping::from_response(protocol, &response))
+    }
+
+    pub fn _nonblocking_but_blocking_requests(
+        &self,
+        requests: impl IntoIterator<Item = nonblocking::Request>,
+    ) -> Result<Vec<nonblocking::Response>, RequestError> {
+        let s = self.socket.lock();
+        nonblocking::blocking_requests(&s, requests)
     }
 }

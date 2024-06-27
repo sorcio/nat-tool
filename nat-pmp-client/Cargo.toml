@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+derive_builder = { version = "0.20.0", optional = true }
 parking_lot = "0.12.1"
 thiserror = "1.0.61"
+tracing = "0.1.40"
 zerocopy = "0.7.34"
 zerocopy-derive = "0.7.34"
+
+[features]
+server = ["dep:derive_builder"]

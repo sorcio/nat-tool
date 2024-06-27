@@ -1,9 +1,14 @@
 use std::net::Ipv4Addr;
 
-use zerocopy::byteorder::{NetworkEndian, U16, U32};
+use zerocopy::{
+    byteorder::{NetworkEndian, U16, U32},
+    FromBytes,
+};
 use zerocopy_derive::{AsBytes, FromBytes, FromZeroes};
 
-use crate::{Lifetime, NatPmpError, Result};
+use crate::{Lifetime, NatPmpError};
+
+type Result<T> = std::result::Result<T, NatPmpError>;
 
 /// Implement TryFrom<int> for enums with `#[repr(int)]` attribute.
 ///
@@ -91,19 +96,21 @@ impl ResultCode {
 
 int_enum! {
     #[repr(u8)]
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq)]
     pub enum Protocol {
         Udp = 1,
         Tcp = 2,
     }
 }
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, AsBytes)]
-pub(crate) enum Opcode {
-    GetExternalAddress = 0,
-    MapUdpPort = 1,
-    MapTcpPort = 2,
+int_enum! {
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, AsBytes, PartialEq)]
+    pub(crate) enum Opcode {
+        GetExternalAddress = 0,
+        MapUdpPort = 1,
+        MapTcpPort = 2,
+    }
 }
 
 impl Opcode {
@@ -117,11 +124,24 @@ impl Opcode {
             Protocol::Tcp => Opcode::MapTcpPort,
         }
     }
+
+    fn try_from_response(response_code: u8) -> core::result::Result<Self, u8> {
+        if response_code & 0x80 == 0 {
+            return Err(response_code);
+        }
+        let code = response_code & 0x7f;
+        match code {
+            0 => Ok(Opcode::GetExternalAddress),
+            1 => Ok(Opcode::MapUdpPort),
+            2 => Ok(Opcode::MapTcpPort),
+            _ => Err(response_code),
+        }
+    }
 }
 
 int_enum! {
     #[repr(u8)]
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq)]
     pub(crate) enum Version {
         NatPmp = 0,
         Pcp = 2,
@@ -130,6 +150,7 @@ int_enum! {
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, FromZeroes, FromBytes)]
+#[cfg_attr(feature = "server", derive(AsBytes))]
 pub(crate) struct ResponseHeader {
     version: u8,
     opcode: u8,
@@ -140,11 +161,25 @@ pub(crate) struct ResponseHeader {
 impl ResponseHeader {
     pub(crate) const SIZE: usize = std::mem::size_of::<Self>();
 
+    #[cfg(feature = "server")]
+    pub(crate) fn new(
+        version: Version,
+        opcode: u8,
+        result: ResultCode,
+        timestamp: Lifetime,
+    ) -> Self {
+        Self {
+            version: version as u8,
+            opcode: opcode | 0x80,
+            result: U16::new(result as u16),
+            timestamp: U32::new(timestamp.duration().as_secs() as u32),
+        }
+    }
+
     pub(crate) fn version(&self) -> core::result::Result<Version, u8> {
         Version::try_from(self.version).map_err(|_| self.version)
     }
 
-    #[allow(unused)] // TODO: see https://datatracker.ietf.org/doc/html/rfc6886#section-3.6
     fn timestamp(&self) -> Lifetime {
         Lifetime::from_secs(self.timestamp.get())
     }
@@ -155,14 +190,68 @@ impl ResponseHeader {
     }
 }
 
+pub(crate) struct ValidatedResponseHeader {
+    version: Version,
+    opcode: Opcode,
+    result: ResultCode,
+    timestamp: Lifetime,
+}
+
+impl ValidatedResponseHeader {
+    pub(crate) fn checked_from_bytes(bytes: &[u8]) -> Option<(Self, &[u8])> {
+        let (data, payload) = bytes.split_at_checked(ResponseHeader::SIZE)?;
+        let header = ResponseHeader::read_from(data)?;
+        tracing::trace!(?header, "parsed response header");
+        let version = header.version().ok()?;
+        tracing::trace!(?version);
+        let opcode = Opcode::try_from_response(header.opcode).ok()?;
+        tracing::trace!(?opcode);
+        let result = ResultCode::try_from(header.result.get()).ok()?;
+        tracing::trace!(result_code = ?result);
+        let timestamp = header.timestamp();
+        Some((
+            Self {
+                version,
+                opcode,
+                result,
+                timestamp,
+            },
+            payload,
+        ))
+    }
+
+    pub(crate) fn version(&self) -> Version {
+        self.version
+    }
+
+    pub(crate) fn opcode(&self) -> Opcode {
+        self.opcode
+    }
+
+    pub(crate) fn result(&self) -> ResultCode {
+        self.result
+    }
+
+    #[allow(unused)] // TODO: see https://datatracker.ietf.org/doc/html/rfc6886#section-3.6
+    pub(crate) fn timestamp(&self) -> Lifetime {
+        self.timestamp
+    }
+}
+
 #[repr(C, packed)]
 #[derive(FromZeroes, FromBytes)]
+#[cfg_attr(feature = "server", derive(AsBytes))]
 pub(crate) struct ResponsePacket<T> {
     header: ResponseHeader,
     payload: T,
 }
 
 impl<T> ResponsePacket<T> {
+    #[cfg(feature = "server")]
+    pub(crate) fn new(header: ResponseHeader, payload: T) -> Self {
+        Self { header, payload }
+    }
+
     pub(crate) fn header(&self) -> &ResponseHeader {
         &self.header
     }
@@ -194,11 +283,17 @@ impl ExternalAddressRequest {
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, FromZeroes, FromBytes)]
+#[cfg_attr(feature = "server", derive(AsBytes))]
 pub struct ExternalAddressResponse {
     ip: [u8; 4],
 }
 
 impl ExternalAddressResponse {
+    #[cfg(feature = "server")]
+    pub(crate) fn new(ip: Ipv4Addr) -> Self {
+        Self { ip: ip.octets() }
+    }
+
     pub fn ip(&self) -> Ipv4Addr {
         Ipv4Addr::from(self.ip)
     }
@@ -239,6 +334,7 @@ impl MapPortRequest {
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, FromZeroes, FromBytes)]
+#[cfg_attr(feature = "server", derive(AsBytes))]
 pub(crate) struct MapPortResponse {
     internal_port: U16<NetworkEndian>,
     external_port: U16<NetworkEndian>,
@@ -246,6 +342,15 @@ pub(crate) struct MapPortResponse {
 }
 
 impl MapPortResponse {
+    #[cfg(feature = "server")]
+    pub(crate) fn new(internal_port: u16, external_port: u16, lifetime: Lifetime) -> Self {
+        Self {
+            internal_port: U16::new(internal_port),
+            external_port: U16::new(external_port),
+            lifetime: U32::new(lifetime.duration().as_secs() as u32),
+        }
+    }
+
     pub(crate) fn internal_port(&self) -> u16 {
         self.internal_port.get()
     }

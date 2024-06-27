@@ -15,6 +15,12 @@ miette = { version = "5.6.0", features = ["fancy-no-backtrace"] }
 nat-pmp-client = { path = "nat-pmp-client" }
 netdev = "0.29.0"
 thiserror = "1.0.61"
+tracing = { version = "0.1.40", default-features = false }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+
+[features]
+default = ["server"]
+server = ["nat-pmp-client/server"]
 
 [profile.release]
 codegen-units = 1
