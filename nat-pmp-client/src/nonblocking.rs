@@ -459,14 +459,10 @@ struct PendingRequests<'c> {
 }
 
 impl<'c> PendingRequests<'c> {
-    fn outgoing<'r>(&'r mut self) -> OutgoingIterator<'r, 'c> {
+    fn outgoing(&mut self) -> OutgoingIterator {
         let inner = self.guard.iter_mut();
         let now = self.client.time_source.now();
-        OutgoingIterator {
-            now,
-            inner,
-            _phantom: std::marker::PhantomData,
-        }
+        OutgoingIterator { now, inner }
     }
 }
 
@@ -509,13 +505,12 @@ enum OutgoingItem {
     Wait(Instant),
 }
 
-struct OutgoingIterator<'r, 'c: 'r> {
+struct OutgoingIterator<'r> {
     now: Instant,
     inner: std::collections::hash_map::IterMut<'r, RequestKey, RequestState>,
-    _phantom: std::marker::PhantomData<&'c ()>,
 }
 
-impl<'r, 'c: 'r> Iterator for OutgoingIterator<'c, 'r> {
+impl<'r> Iterator for OutgoingIterator<'r> {
     type Item = OutgoingItem;
 
     fn next(&mut self) -> Option<Self::Item> {
