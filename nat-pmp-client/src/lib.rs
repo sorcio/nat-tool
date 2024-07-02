@@ -241,12 +241,4 @@ impl NatPmpClient {
         let response = self.do_request(&s, &map_port)?;
         Ok(PortMapping::from_response(protocol, &response))
     }
-
-    pub fn _nonblocking_but_blocking_requests(
-        &self,
-        requests: impl IntoIterator<Item = nonblocking::Request>,
-    ) -> Result<Vec<nonblocking::Response>, RequestError> {
-        let s = self.socket.lock();
-        nonblocking::blocking_requests(&s, requests)
-    }
 }

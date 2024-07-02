@@ -9,9 +9,10 @@ use std::{fmt::Display, net::Ipv4Addr};
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{Context, IntoDiagnostic, Result};
 
+use nat_pmp_client::nonblocking::SyncUdpClient;
 #[cfg(feature = "server")]
 use nat_pmp_client::server::TestServerOptions;
-use nat_pmp_client::{nonblocking, Lifetime, NatPmpClient, Protocol};
+use nat_pmp_client::{nonblocking, Lifetime, Protocol};
 use tracing::Level;
 use tracing_subscriber::fmt::format::FmtSpan;
 
@@ -29,7 +30,7 @@ struct Cli {
 }
 
 impl Cli {
-    fn make_client(&self) -> Result<NatPmpClient> {
+    fn make_client(&self) -> Result<SyncUdpClient> {
         let gateway = if let Some(gateway) = self.gateway {
             gateway
         } else {
@@ -37,7 +38,7 @@ impl Cli {
                 .into_diagnostic()
                 .wrap_err("no gateway was provided, and no default gateway could be found")?
         };
-        NatPmpClient::new(gateway, self.port).into_diagnostic()
+        SyncUdpClient::new(gateway, self.port).into_diagnostic()
     }
 
     #[cfg(feature = "server")]
@@ -136,7 +137,15 @@ impl PortType {
 fn external_address(cli: &Cli) -> Result<()> {
     let client = cli.make_client()?;
 
-    let external_address = client.external_address().into_diagnostic()?;
+    let fut = client.external_address().into_diagnostic()?;
+    let response = client
+        .wait_for_responses([fut])
+        .into_diagnostic()?
+        .into_iter()
+        .next()
+        .unwrap();
+    let external_address = response.external_address().into_diagnostic()?;
+
     println!("external address: {}", external_address.ip());
     Ok(())
 }
@@ -152,20 +161,25 @@ fn map_port(cli: &Cli, map_port_args: &MapPortArgs) -> Result<()> {
     let client = cli.make_client()?;
     loop {
         let mut least_lifetime = Duration::MAX;
-        let mut requests = vec![];
+        let mut futures = vec![];
         if map_port_args.external_address {
-            requests.push(nonblocking::Request::ExternalAddress);
+            futures.push(client.external_address().into_diagnostic()?);
         }
-        requests.extend(map_port_args.protocol.protocols().iter().map(|&protocol| {
-            nonblocking::Request::MapPort {
-                internal_port: map_port_args.internal_port,
-                external_port: map_port_args.external_port,
-                protocol,
-                lifetime: map_port_args.lifetime,
-            }
-        }));
+        for protocol in map_port_args.protocol.protocols() {
+            futures.push(
+                client
+                    .map_port(
+                        *protocol,
+                        map_port_args.internal_port,
+                        map_port_args.external_port,
+                        map_port_args.lifetime,
+                    )
+                    .into_diagnostic()?,
+            );
+        }
+
         let responses = client
-            ._nonblocking_but_blocking_requests(requests)
+            .wait_for_responses(futures)
             .into_diagnostic()
             .wrap_err("cannot send request to NAT-PMP gateway")?;
 
@@ -175,19 +189,14 @@ fn map_port(cli: &Cli, map_port_args: &MapPortArgs) -> Result<()> {
         });
         tracing::debug!("external address: {:?}", external_address);
         for response in responses {
-            match response.data().into_diagnostic()? {
-                nonblocking::ResponseData::MapPort(result) => {
-                    least_lifetime = result.lifetime.duration().min(least_lifetime);
-                    let notification = output::NatPmpNotification::from_response(
-                        result.protocol,
-                        result.clone(),
-                        external_address,
-                    );
-                    println!("{}", notification.format(map_port_args.format));
-                }
-                _ => {
-                    tracing::debug!(?response, "unexpected response");
-                }
+            if let nonblocking::ResponseData::MapPort(result) = response.data().into_diagnostic()? {
+                least_lifetime = result.lifetime.duration().min(least_lifetime);
+                let notification = output::NatPmpNotification::from_response(
+                    result.protocol,
+                    result.clone(),
+                    external_address,
+                );
+                println!("{}", notification.format(map_port_args.format));
             }
         }
         if !map_port_args.repeat {

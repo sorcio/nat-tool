@@ -1,7 +1,8 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::ops::Deref;
 use std::time::{Duration, Instant};
 
 use crate::packets::{
@@ -10,7 +11,7 @@ use crate::packets::{
 };
 use crate::{Lifetime, NatPmpError, PortMapping, Protocol, RequestError};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use tracing::instrument;
 use zerocopy::{AsBytes, FromBytes};
 
@@ -71,17 +72,22 @@ impl Request {
         }
     }
 
-    fn as_bytes(&self) -> Vec<u8> {
+    fn as_bytes(&self) -> FixedSizeBuffer {
         match self {
-            Request::ExternalAddress => ExternalAddressRequest::new().as_bytes().to_vec(),
+            Request::ExternalAddress => {
+                let request = ExternalAddressRequest::new();
+                FixedSizeBuffer::from_pod(request)
+            }
             Request::MapPort {
                 internal_port,
                 external_port,
                 protocol,
                 lifetime,
-            } => MapPortRequest::new(*internal_port, *external_port, *protocol, *lifetime)
-                .as_bytes()
-                .to_vec(),
+            } => {
+                let request =
+                    MapPortRequest::new(*internal_port, *external_port, *protocol, *lifetime);
+                FixedSizeBuffer::from_pod(request)
+            }
         }
     }
 }
@@ -150,7 +156,7 @@ impl RequestState {
         }
     }
 
-    fn as_bytes(&self) -> Vec<u8> {
+    fn as_bytes(&self) -> FixedSizeBuffer {
         self.request.as_bytes()
     }
 
@@ -178,6 +184,22 @@ impl Response {
 
     pub fn time(&self) -> Instant {
         self.time
+    }
+
+    pub fn external_address(self) -> Result<ExternalAddressResponse, NatPmpError> {
+        match self.data {
+            Ok(ResponseData::ExternalAddress(addr)) => Ok(addr),
+            Ok(_) => panic!("Response is not an external address response"),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn port_mapping(self) -> Result<PortMapping, NatPmpError> {
+        match self.data {
+            Ok(ResponseData::MapPort(mapping)) => Ok(mapping),
+            Ok(_) => panic!("Response is not a port mapping response"),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -422,89 +444,96 @@ impl NonblockingClient {
         };
     }
 
-    fn send_outgoing(&self) -> (Vec<Vec<u8>>, Option<Instant>) {
-        let mut requests = self.pending_requests.lock();
-        let mut next_deadline = None;
-        let now = self.time_source.now();
-        let mut outgoing_packets = vec![];
-        for (_, request) in requests.iter_mut() {
-            match request.should_send(now) {
-                ShouldSend::No => (),
-                ShouldSend::Now => {
-                    tracing::info!(?request, "sending request");
-                    let data = request.as_bytes();
-                    request.increment_attempts();
-                    outgoing_packets.push(data);
-                }
-                ShouldSend::Later(deadline) => {
-                    next_deadline =
-                        Some(next_deadline.map_or(deadline, |d: Instant| d.min(deadline)));
-                }
-            }
+    fn pending_requests(&self) -> PendingRequests {
+        let guard = self.pending_requests.lock();
+        PendingRequests {
+            client: self,
+            guard,
         }
-        (outgoing_packets, next_deadline)
     }
 }
 
-#[instrument(skip_all)]
-pub fn blocking_requests(
-    socket: &UdpSocket,
-    requests: impl IntoIterator<Item = Request>,
-) -> Result<Vec<Response>, RequestError> {
-    tracing::info!("sending blocking requests");
-    let client = NonblockingClient::default();
-    let futures: Vec<_> = requests
-        .into_iter()
-        .inspect(|request| tracing::info!(?request))
-        .map(|request| client.request(request))
-        .collect::<Result<Vec<_>, _>>()?;
+struct PendingRequests<'c> {
+    client: &'c NonblockingClient,
+    guard: MutexGuard<'c, HashMap<RequestKey, RequestState>>,
+}
 
-    let (outgoing, mut next_deadline) = client.send_outgoing();
-    for data in outgoing {
-        socket.send(&data)?;
+impl<'c> PendingRequests<'c> {
+    fn outgoing<'r>(&'r mut self) -> OutgoingIterator<'r, 'c> {
+        let inner = self.guard.iter_mut();
+        let now = self.client.time_source.now();
+        OutgoingIterator {
+            now,
+            inner,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+const MAX_SIZE: usize = 1024;
+struct FixedSizeBuffer {
+    buf: [u8; MAX_SIZE],
+    len: usize,
+}
+
+impl FixedSizeBuffer {
+    fn from_pod<T: AsBytes>(data: T) -> Self {
+        let bytes = data.as_bytes();
+        Self::from_slice(bytes)
     }
 
-    let mut buf = [0; 1024];
-    loop {
-        loop {
-            if let Some(next_deadline) = next_deadline {
-                let now = Instant::now();
-                let timeout = next_deadline - now;
-                socket.set_read_timeout(Some(timeout))?;
-            }
-            match socket.recv_from(&mut buf) {
-                Ok((size, sock_addr)) => {
-                    let data = &buf[..size];
-                    tracing::trace!(?sock_addr, ?data, "received packet");
-                    let source = ipv4_addr_from_socket_addr(&sock_addr, Ipv4Addr::UNSPECIFIED);
-                    client.parse_packet(source, data);
-                    if let Some(responses) = futures
-                        .iter()
-                        .map(|f| f.poll_response())
-                        .collect::<Option<Vec<_>>>()
-                    {
-                        tracing::trace!(?responses, "responses ready");
-                        return Ok(responses);
-                    }
-                }
-                Err(err) => match err.kind() {
-                    ErrorKind::WouldBlock | ErrorKind::TimedOut => {
-                        tracing::trace!("no packet received yet");
-                        break;
-                    }
-                    _ => return Err(err.into()),
-                },
-            }
-        }
+    fn from_slice(data: &[u8]) -> Self {
+        assert!(data.len() <= MAX_SIZE);
+        let mut buf = [0; MAX_SIZE];
+        let len = data.len();
+        buf[..len].copy_from_slice(data);
+        FixedSizeBuffer { buf, len }
+    }
 
-        let (outgoing, deadline) = client.send_outgoing();
-        for data in outgoing {
-            socket.send(&data)?;
-        }
-        if deadline.is_some() {
-            next_deadline = deadline;
-        } else {
-            return Err(NatPmpError::ResponseTimeout.into());
+    fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl Deref for FixedSizeBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+enum OutgoingItem {
+    Send(FixedSizeBuffer),
+    Wait(Instant),
+}
+
+struct OutgoingIterator<'r, 'c: 'r> {
+    now: Instant,
+    inner: std::collections::hash_map::IterMut<'r, RequestKey, RequestState>,
+    _phantom: std::marker::PhantomData<&'c ()>,
+}
+
+impl<'r, 'c: 'r> Iterator for OutgoingIterator<'c, 'r> {
+    type Item = OutgoingItem;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (_key, request) = self.inner.next()?;
+            match request.should_send(self.now) {
+                ShouldSend::No => (),
+                ShouldSend::Now => {
+                    tracing::info!(?request, "sending request");
+
+                    let buf = request.as_bytes();
+                    request.increment_attempts();
+                    return Some(OutgoingItem::Send(buf));
+                }
+                ShouldSend::Later(deadline) => {
+                    return Some(OutgoingItem::Wait(deadline));
+                }
+            }
         }
     }
 }
@@ -513,5 +542,118 @@ fn ipv4_addr_from_socket_addr(addr: &SocketAddr, default: Ipv4Addr) -> Ipv4Addr 
     match addr {
         SocketAddr::V4(v4) => *v4.ip(),
         _ => default,
+    }
+}
+
+pub struct SyncUdpClient {
+    socket: UdpSocket,
+    inner: NonblockingClient,
+}
+
+impl SyncUdpClient {
+    pub fn new(gateway: Ipv4Addr, port: u16) -> Result<Self, std::io::Error> {
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
+        let gw_addr = SocketAddrV4::new(gateway, port);
+        socket.connect(gw_addr)?;
+        Ok(Self {
+            socket,
+            inner: NonblockingClient::default(),
+        })
+    }
+
+    pub fn request(&self, request: Request) -> Result<ResponseFuture, NatPmpError> {
+        self.inner.request(request)
+    }
+
+    pub fn external_address(&self) -> Result<ResponseFuture, NatPmpError> {
+        self.request(Request::ExternalAddress)
+    }
+
+    pub fn map_port(
+        &self,
+        protocol: Protocol,
+        internal_port: u16,
+        external_port: u16,
+        lifetime: Lifetime,
+    ) -> Result<ResponseFuture, NatPmpError> {
+        self.request(Request::MapPort {
+            protocol,
+            internal_port,
+            external_port,
+            lifetime,
+        })
+    }
+
+    pub fn wait_for_responses<'s>(
+        &'s self,
+        futures: impl IntoIterator<Item = ResponseFuture<'s>> + 's,
+    ) -> Result<Vec<Response>, RequestError> {
+        let socket = &self.socket;
+        let client = &self.inner;
+        let mut next_deadline = self.send_outgoing()?;
+
+        let mut pending = futures.into_iter().collect::<Vec<_>>();
+        let mut responses = Vec::with_capacity(pending.len());
+
+        let mut buf = [0; 1024];
+        loop {
+            loop {
+                if let Some(next_deadline) = next_deadline {
+                    let now = Instant::now();
+                    let timeout = next_deadline - now;
+                    socket.set_read_timeout(Some(timeout))?;
+                }
+                match socket.recv_from(&mut buf) {
+                    Ok((size, sock_addr)) => {
+                        let data = &buf[..size];
+                        tracing::trace!(?sock_addr, ?data, "received packet");
+                        let source = ipv4_addr_from_socket_addr(&sock_addr, Ipv4Addr::UNSPECIFIED);
+                        client.parse_packet(source, data);
+                        pending.retain(|f| {
+                            if let Some(response) = f.poll_response() {
+                                responses.push(response);
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        if pending.is_empty() {
+                            tracing::trace!(?responses, "responses ready");
+                            return Ok(responses);
+                        }
+                    }
+                    Err(err) => match err.kind() {
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+                            tracing::trace!("no packet received yet");
+                            break;
+                        }
+                        _ => return Err(err.into()),
+                    },
+                }
+            }
+
+            if let Some(deadline) = self.send_outgoing()? {
+                next_deadline = Some(deadline);
+            } else {
+                return Err(NatPmpError::ResponseTimeout.into());
+            }
+        }
+    }
+
+    fn send_outgoing(&self) -> Result<Option<Instant>, std::io::Error> {
+        self.inner
+            .pending_requests()
+            .outgoing()
+            .map(|data| match data {
+                OutgoingItem::Wait(deadline) => Ok(Some(deadline)),
+                OutgoingItem::Send(data) => self.socket.send(&data).map(|_| None),
+            })
+            .try_fold(None, |next_deadline, item| match item {
+                Ok(Some(deadline)) => Ok(Some(
+                    next_deadline.map_or(deadline, |d: Instant| d.min(deadline)),
+                )),
+                Ok(None) => Ok(next_deadline),
+                Err(e) => Err(e),
+            })
     }
 }
