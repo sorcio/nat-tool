@@ -11,6 +11,7 @@ description = "Control port mappings for a gateway compatible with NAT-PMP"
 
 [dependencies]
 clap = { version = "4.1.8", features = ["derive", "env"] }
+console = { version = "0.15.8", optional = true }
 miette = { version = "5.6.0", features = ["fancy-no-backtrace"] }
 nat-pmp-client = { path = "nat-pmp-client" }
 netdev = "0.29.0"
@@ -20,7 +21,7 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 
 [features]
 default = ["server"]
-server = ["nat-pmp-client/server"]
+server = ["nat-pmp-client/server", "dep:console"]
 
 [profile.release]
 codegen-units = 1

@@ -7,6 +7,7 @@ use std::{
 };
 
 use derive_builder::Builder;
+use parking_lot::Mutex;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 use zerocopy_derive::{FromBytes, FromZeroes};
 
@@ -224,6 +225,32 @@ pub struct TestServerOptions {
     allow_random_internal_ports: bool,
 }
 
+impl TestServerOptions {
+    pub fn build_server(self) -> Result<UdpServer, std::io::Error> {
+        UdpServer::new(self)
+    }
+
+    pub fn bind_address(&self) -> SocketAddrV4 {
+        self.bind_address
+    }
+
+    pub fn external_address(&self) -> Option<Ipv4Addr> {
+        self.external_address
+    }
+
+    pub fn port_ranges(&self) -> &[PortMappingOptions] {
+        &self.port_ranges
+    }
+
+    pub fn allow_random_external_ports(&self) -> bool {
+        self.allow_random_external_ports
+    }
+
+    pub fn allow_random_internal_ports(&self) -> bool {
+        self.allow_random_internal_ports
+    }
+}
+
 impl Default for TestServerOptions {
     fn default() -> Self {
         Self {
@@ -271,9 +298,20 @@ impl ResponseBuilder {
 struct Server {
     options: TestServerOptions,
     start_time: Instant,
+    external_address: Mutex<Option<Ipv4Addr>>,
 }
 
 impl Server {
+    fn new(options: TestServerOptions) -> Self {
+        let start_time = Instant::now();
+        let external_address = Mutex::new(options.external_address);
+        Self {
+            options,
+            start_time,
+            external_address,
+        }
+    }
+
     fn process_packet(&self, data: &[u8], source: SocketAddr, respond: impl Fn(&[u8])) {
         tracing::trace!(packet = ?data);
         let timestamp = Lifetime::try_from(self.start_time.elapsed()).expect("ran too long");
@@ -348,7 +386,7 @@ impl Server {
         &self,
         builder: ResponseBuilder,
     ) -> ResponsePacket<ExternalAddressResponse> {
-        if let Some(external_address) = self.options.external_address {
+        if let Some(external_address) = *self.external_address.lock() {
             builder.success(ExternalAddressResponse::new(external_address))
         } else {
             tracing::info!("request rejected because of configuration");
@@ -428,26 +466,72 @@ impl Server {
             )
         }
     }
+
+    fn set_external_address(&self, external_address: Option<Ipv4Addr>) -> bool {
+        let mut guard = self.external_address.lock();
+        if *guard != external_address {
+            *guard = external_address;
+            external_address.is_some()
+        } else {
+            false
+        }
+    }
+
+    fn external_address_announcement(&self) -> Option<ResponsePacket<ExternalAddressResponse>> {
+        let external_address = (*self.external_address.lock())?;
+        let timestamp = Lifetime::try_from(self.start_time.elapsed()).expect("ran too long");
+        let response = ResponseBuilder::new(Opcode::get_external_address() as u8, timestamp);
+        Some(response.success(ExternalAddressResponse::new(external_address)))
+    }
 }
 
-pub fn run(options: TestServerOptions) -> std::io::Result<()> {
-    let start_time = Instant::now();
-    let server = Server {
-        options,
-        start_time,
-    };
-    let socket = UdpSocket::bind(server.options.bind_address)?;
-    loop {
-        let mut buf = [0; 256];
-        let (amt, source) = socket.recv_from(&mut buf)?;
-        let packet_span = tracing::info_span!("request", ?source);
-        let _enter = packet_span.enter();
-        let data = &buf[..amt];
-        server.process_packet(data, source, |response| {
-            if let Err(err) = socket.send_to(response, source) {
-                tracing::error!(?err, "failed to send response");
-            }
-        });
+pub struct UdpServer {
+    inner: Server,
+    socket: UdpSocket,
+}
+
+impl UdpServer {
+    pub fn new(options: TestServerOptions) -> std::io::Result<Self> {
+        let inner = Server::new(options);
+        let socket = UdpSocket::bind(inner.options.bind_address)?;
+        Ok(Self { inner, socket })
+    }
+
+    pub fn run(&self) -> std::io::Result<()> {
+        loop {
+            let mut buf = [0; 256];
+            let (amt, source) = self.socket.recv_from(&mut buf)?;
+            let packet_span = tracing::info_span!("request", ?source);
+            let _enter = packet_span.enter();
+            let data = &buf[..amt];
+            self.inner.process_packet(data, source, |response| {
+                if let Err(err) = self.socket.send_to(response, source) {
+                    tracing::error!(?err, "failed to send response");
+                }
+            });
+        }
+    }
+
+    pub fn external_address(&self) -> Option<Ipv4Addr> {
+        *self.inner.external_address.lock()
+    }
+
+    pub fn set_external_address(&self, external_address: Option<Ipv4Addr>) -> std::io::Result<()> {
+        if self.inner.set_external_address(external_address) {
+            self.announce()
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn announce(&self) -> std::io::Result<()> {
+        let Some(packet) = self.inner.external_address_announcement() else {
+            tracing::info!("external address not set, skipping announcement");
+            return Ok(());
+        };
+        let multi_addr = Ipv4Addr::new(224, 0, 0, 1);
+        let _ = self.socket.send_to(packet.as_bytes(), (multi_addr, 5350))?;
+        Ok(())
     }
 }
 

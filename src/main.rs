@@ -38,7 +38,7 @@ impl Cli {
                 .into_diagnostic()
                 .wrap_err("no gateway was provided, and no default gateway could be found")?
         };
-        SyncUdpClient::new(gateway, self.port).into_diagnostic()
+        SyncUdpClient::new(gateway, self.port, nonblocking::Announcements::Listen).into_diagnostic()
     }
 
     #[cfg(feature = "server")]
@@ -71,6 +71,8 @@ enum Commands {
     /// Run a fake NAT-PMP server (for testing)
     #[cfg(feature = "server")]
     Server(server::ServerArgs),
+    /// experimental feature: listen to external address changes
+    ExternalAddressAnnouncements,
 }
 
 #[derive(Debug, clap::Args)]
@@ -150,13 +152,19 @@ fn external_address(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn map_port(cli: &Cli, map_port_args: &MapPortArgs) -> Result<()> {
-    tracing_subscriber::fmt::fmt()
-        .with_span_events(FmtSpan::FULL)
-        .with_max_level(Level::TRACE)
-        .compact()
-        .init();
+fn external_address_announcements(cli: &Cli) -> Result<()> {
+    let client = cli.make_client()?;
+    let mut last_external_address = None;
+    loop {
+        let external_address = client.wait_for_next_announcement().into_diagnostic()?.ip();
+        if last_external_address != Some(external_address) {
+            println!("external address: {}", external_address);
+            last_external_address = Some(external_address);
+        }
+    }
+}
 
+fn map_port(cli: &Cli, map_port_args: &MapPortArgs) -> Result<()> {
     tracing::info!("starting map_port");
     let client = cli.make_client()?;
     loop {
@@ -209,11 +217,18 @@ fn map_port(cli: &Cli, map_port_args: &MapPortArgs) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    tracing_subscriber::fmt::fmt()
+        .with_span_events(FmtSpan::FULL)
+        .with_max_level(Level::TRACE)
+        .compact()
+        .init();
+
     let cli = Cli::parse();
     match &cli.command {
         Commands::ExternalAddress => external_address(&cli),
         Commands::MapPort(map_port_args) => map_port(&cli, map_port_args),
         #[cfg(feature = "server")]
         Commands::Server(server_args) => server::run_server(&cli, server_args),
+        Commands::ExternalAddressAnnouncements => external_address_announcements(&cli),
     }
 }

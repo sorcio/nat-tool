@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::packets::{
     ExternalAddressRequest, ExternalAddressResponse, MapPortRequest, MapPortResponse, Opcode,
-    ValidatedResponseHeader, Version,
+    ResponseHeader, ValidatedResponseHeader, Version,
 };
 use crate::{Lifetime, NatPmpError, PortMapping, Protocol, RequestError};
 
@@ -538,20 +538,85 @@ fn ipv4_addr_from_socket_addr(addr: &SocketAddr, default: Ipv4Addr) -> Ipv4Addr 
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Announcements {
+    #[default]
+    DontListen,
+    Listen,
+}
+
 pub struct SyncUdpClient {
     socket: UdpSocket,
+    multicast_socket: Option<UdpSocket>,
     inner: NonblockingClient,
 }
 
 impl SyncUdpClient {
-    pub fn new(gateway: Ipv4Addr, port: u16) -> Result<Self, std::io::Error> {
+    pub fn new(
+        gateway: Ipv4Addr,
+        port: u16,
+        announcements: Announcements,
+    ) -> Result<Self, std::io::Error> {
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
         let gw_addr = SocketAddrV4::new(gateway, port);
         socket.connect(gw_addr)?;
+
+        let multicast_socket = if let Announcements::Listen = announcements {
+            // From RFC 6886 (3.2.1):
+            // IMPLEMENTATION NOTE: A given host may have more than one independent
+            // NAT-PMP client running at the same time, and address announcements
+            // need to be available to all of them.  Clients should therefore set
+            // the SO_REUSEPORT option or equivalent in order to allow other
+            // processes to also listen on port 5350.  Additionally, implementers
+            // have encountered issues when one or more processes on the same device
+            // listen to port 5350 on *all* addresses.  Clients should therefore
+            // bind specifically to 224.0.0.1:5350, not to 0.0.0.0:5350.
+            //
+            // TODO: set SO_REUSEPORT
+            let local_addr = socket.local_addr()?;
+            let local_ipv4 = ipv4_addr_from_socket_addr(&local_addr, Ipv4Addr::UNSPECIFIED);
+            tracing::info!(?local_ipv4, "listening for announcements");
+            let multicast_bind_addr = SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 1), 5350);
+            let multicast_socket = UdpSocket::bind(multicast_bind_addr)?;
+            multicast_socket.join_multicast_v4(&Ipv4Addr::new(224, 0, 0, 1), &local_ipv4)?;
+            Some(multicast_socket)
+        } else {
+            None
+        };
+
         Ok(Self {
             socket,
+            multicast_socket,
             inner: NonblockingClient::default(),
         })
+    }
+
+    /// Wait for the next announcement from the gateway.
+    /// This method WILL be removed in the future.
+    pub fn wait_for_next_announcement(&self) -> Result<ExternalAddressResponse, RequestError> {
+        let mut buf = [0; 32];
+        #[allow(clippy::never_loop)] // (see TODO below)
+        let len = loop {
+            let (len, _addr) = self
+                .multicast_socket
+                .as_ref()
+                .unwrap()
+                .recv_from(&mut buf)?;
+
+            // From RFC 6886 (3.2.1):
+            // Upon receiving a gratuitous address announcement packet, the client
+            // MUST check the source IP address, and silently discard the packet if
+            // the address is not the address of the client's current configured
+            // gateway.  This is to guard against inadvertent misconfigurations
+            // where there may be more than one NAT gateway active on the network.
+            // TODO: check addr
+            break len;
+        };
+        let header = ResponseHeader::read_from(&buf[..size_of::<ResponseHeader>()])
+            .ok_or(NatPmpError::BadResponse)?;
+        let bytes = &buf[size_of::<ResponseHeader>()..len];
+        tracing::debug!(?header, ?bytes, "received announcement");
+        ExternalAddressResponse::read_from(bytes).ok_or(NatPmpError::BadResponse.into())
     }
 
     pub fn request(&self, request: Request) -> Result<ResponseFuture, NatPmpError> {

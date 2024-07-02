@@ -1,10 +1,8 @@
 use std::net::Ipv4Addr;
 
-use miette::IntoDiagnostic;
-use nat_pmp_client::server::{PortMappingOptions, PortRange, ProtocolOptions};
+use miette::{Context as _, IntoDiagnostic};
+use nat_pmp_client::server::{PortMappingOptions, PortRange, ProtocolOptions, UdpServer};
 use thiserror::Error;
-use tracing::Level;
-use tracing_subscriber::fmt::format::FmtSpan;
 
 use crate::Cli;
 
@@ -139,18 +137,163 @@ where
     }
 }
 
-pub(crate) fn run_server(cli: &Cli, server_args: &ServerArgs) -> crate::Result<()> {
-    tracing_subscriber::fmt::fmt()
-        .with_span_events(FmtSpan::FULL)
-        .with_max_level(Level::TRACE)
-        .compact()
-        .init();
-
-    dbg!(server_args.external_address);
-    dbg!(&server_args.port_mappings);
-
+pub(crate) fn run_server(cli: &Cli, _server_args: &ServerArgs) -> crate::Result<()> {
     let config = cli.make_server_config()?;
-    nat_pmp_client::server::run(config).into_diagnostic()
+
+    let server = config.build_server().into_diagnostic()?;
+    let server = Box::leak(Box::new(server));
+    let handle = std::thread::spawn(|| server.run());
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    if handle.is_finished() {
+        let err = handle.join().expect("server thread panicked");
+        return err.into_diagnostic().wrap_err("server exited prematurely");
+    }
+
+    if console_handler(server).is_err() {
+        // Probably console is not available or was closed, so it's unlikely we
+        // can report an error to anyone who cares. Forget about the terminal
+        // and just wait the server thread.
+        handle
+            .join()
+            .expect("server thread panicked")
+            .into_diagnostic()?;
+    }
+
+    Ok(())
+}
+
+fn console_handler(server: &UdpServer) -> std::io::Result<()> {
+    use console::{Key, Term};
+    use std::io::Write;
+    let mut term = Term::stdout();
+    writeln!(
+        term,
+        "Fake NAT-PMP server started. Interactive console commands:"
+    )?;
+    show_help(&mut term)?;
+
+    fn show_help(term: &mut Term) -> std::io::Result<()> {
+        writeln!(term, "q: quit (also ctrl-c)")?;
+        writeln!(term, "a: announce new external address")?;
+        writeln!(term, "h: show this help")?;
+        Ok(())
+    }
+
+    loop {
+        match term.read_key() {
+            Ok(Key::Char('q')) => {
+                // quit
+                return Ok(());
+            }
+            Ok(Key::Char('h') | Key::Char('?')) => {
+                // show help
+                show_help(&mut term)?;
+            }
+            Ok(Key::Char('a')) => {
+                // announce new external address
+                let current_address = server.external_address();
+                writeln!(term, "current address: {}", DisplayAddr(current_address))?;
+                let new_address = match prompt_address(&mut term)? {
+                    PromptResult::Some(addr) => Some(addr),
+                    PromptResult::None => None,
+                    PromptResult::Abort => {
+                        writeln!(term, "external address unchanged")?;
+                        continue;
+                    }
+                };
+                writeln!(
+                    term,
+                    "setting external address to {}",
+                    DisplayAddr(new_address)
+                )?;
+                if let Err(err) = server.set_external_address(new_address) {
+                    writeln!(term, "error while setting external address: {err}")?;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+}
+
+struct DisplayAddr(Option<Ipv4Addr>);
+
+impl std::fmt::Display for DisplayAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(addr) => write!(f, "{addr}"),
+            None => write!(f, "none"),
+        }
+    }
+}
+
+enum PromptResult<T> {
+    Some(T),
+    None,
+    Abort,
+}
+
+fn prompt_address(term: &mut console::Term) -> std::io::Result<PromptResult<Ipv4Addr>> {
+    loop {
+        let prompt = "new external address > ";
+        if let Some(new_address) = read_line_initial_text(term, prompt)? {
+            let new_address = new_address.trim();
+            if new_address.is_empty() {
+                return Ok(PromptResult::None);
+            } else if let Ok(new_address) = new_address.parse() {
+                return Ok(PromptResult::Some(new_address));
+            } else {
+                term.write_line(&format!(
+                    "unable to parse `{new_address}` as an IPv4 address; try again"
+                ))?;
+            }
+        } else {
+            return Ok(PromptResult::Abort);
+        }
+    }
+}
+
+pub fn read_line_initial_text(
+    term: &console::Term,
+    initial: &str,
+) -> std::io::Result<Option<String>> {
+    // adapted from `console::Term::read_line_initial_text`, additionally responding to
+    // escape key as an "abort" option
+
+    use console::Key;
+
+    term.write_str(initial)?;
+    let prefix_len = initial.len();
+    let mut chars: Vec<char> = initial.chars().collect();
+    loop {
+        match term.read_key()? {
+            Key::Backspace => {
+                if prefix_len < chars.len() && chars.pop().is_some() {
+                    term.clear_chars(1)?;
+                }
+                term.flush()?;
+            }
+            Key::Char(chr) => {
+                chars.push(chr);
+                let mut bytes_char = [0; 4];
+                term.write_str(chr.encode_utf8(&mut bytes_char))?;
+                term.flush()?;
+            }
+            Key::Enter => {
+                term.write_str("\n")?;
+                term.flush()?;
+                break;
+            }
+            Key::Escape => {
+                term.write_str("\n")?;
+                term.flush()?;
+                return Ok(None);
+            }
+            _ => (),
+        }
+    }
+    Ok(Some(chars.iter().skip(prefix_len).collect::<String>()))
 }
 
 #[cfg(test)]
