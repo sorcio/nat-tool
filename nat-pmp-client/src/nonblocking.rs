@@ -466,13 +466,12 @@ impl<'c> PendingRequests<'c> {
     }
 }
 
-const MAX_SIZE: usize = 1024;
-struct FixedSizeBuffer {
+struct FixedSizeBuffer<const MAX_SIZE: usize = 16> {
     buf: [u8; MAX_SIZE],
     len: usize,
 }
 
-impl FixedSizeBuffer {
+impl<const MAX_SIZE: usize> FixedSizeBuffer<MAX_SIZE> {
     fn from_pod<T: AsBytes>(data: T) -> Self {
         let bytes = data.as_bytes();
         Self::from_slice(bytes)
@@ -499,7 +498,6 @@ impl Deref for FixedSizeBuffer {
     }
 }
 
-#[allow(clippy::large_enum_variant)]
 enum OutgoingItem {
     Send(FixedSizeBuffer),
     Wait(Instant),
