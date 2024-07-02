@@ -344,7 +344,7 @@ impl NonblockingClient {
             return;
         };
         if header.version() != Version::NatPmp {
-            // TODO: log error
+            tracing::trace!("version mismatch (maybe not a NAT-PMP response)");
         }
         let opcode = header.opcode();
         let mut pending_requests = self.pending_requests.lock();
