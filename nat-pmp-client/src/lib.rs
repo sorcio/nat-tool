@@ -27,7 +27,7 @@ use zerocopy::{AsBytes, FromBytes};
 pub struct Lifetime(u32);
 
 impl Lifetime {
-    const ZERO: Self = Self(0);
+    pub const ZERO: Self = Self(0);
 
     pub const fn from_secs(secs: u32) -> Self {
         Lifetime(secs)
