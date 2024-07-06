@@ -20,16 +20,29 @@ use tracing_subscriber::fmt::format::FmtSpan;
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// NAT-PMP gateway IP address (if not specified, try to use the default gateway)
-    #[arg(short, long, env)]
+    #[arg(short, long, env, global = true)]
     gateway: Option<Ipv4Addr>,
     /// Use this port instead of the NAT-PMP default
     #[arg(short, long, default_value_t = 5351)]
     port: u16,
     #[command(subcommand)]
     command: Commands,
+    #[command(flatten)]
+    #[group(multiple = false)]
+    verbosity: VerbosityArgs,
 }
 
 impl Cli {
+    fn configure_logging(&self) {
+        let level = Option::<Level>::from(self.verbosity.log_level());
+
+        tracing_subscriber::fmt::fmt()
+            .with_span_events(FmtSpan::FULL)
+            .with_max_level(level)
+            .compact()
+            .init();
+    }
+
     fn make_client(&self) -> Result<SyncUdpClient> {
         let gateway = if let Some(gateway) = self.gateway {
             gateway
@@ -59,6 +72,107 @@ impl Cli {
         options.external_address(server_args.external_address.into_option());
         options.port_ranges(server_args.port_mappings.clone());
         Ok(options.build().unwrap())
+    }
+}
+
+#[derive(clap::Args, Debug, Clone, Default)]
+#[command(about = None, long_about = None)]
+pub struct VerbosityArgs {
+    /// Increase logging verbosity
+    #[arg(
+        long,
+        short = 'v',
+        action = clap::ArgAction::Count,
+        global = true,
+        help_heading = "Logging options",
+    )]
+    verbose: u8,
+
+    /// Decrease logging verbosity
+    #[arg(
+        long,
+        short = 'q',
+        action = clap::ArgAction::Count,
+        global = true,
+        conflicts_with_all = &["verbose", "log_level"],
+        help_heading = "Logging options",
+    )]
+    quiet: u8,
+
+    /// Logging verbosity level
+    ///
+    /// Can also be set using the `-v` and `-q` flags.
+    #[arg(
+        long,
+        short = 'l',
+        global = true,
+        value_enum,
+        default_value_t = LogLevel::default(),
+        conflicts_with_all = &["verbose", "quiet"],
+        help_heading = "Logging options",
+    )]
+    log_level: LogLevel,
+}
+
+impl VerbosityArgs {
+    fn modifier(&self) -> i8 {
+        self.quiet as i8 - self.verbose as i8
+    }
+
+    fn log_level(&self) -> LogLevel {
+        self.log_level.modify(self.modifier())
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum LogLevel {
+    Trace,
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+    Off,
+}
+
+impl TryFrom<u8> for LogLevel {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, ()> {
+        match value {
+            0 => Ok(LogLevel::Trace),
+            1 => Ok(LogLevel::Debug),
+            2 => Ok(LogLevel::Info),
+            3 => Ok(LogLevel::Warn),
+            4 => Ok(LogLevel::Error),
+            5 => Ok(LogLevel::Off),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<LogLevel> for Option<Level> {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Trace => Some(Level::TRACE),
+            LogLevel::Debug => Some(Level::DEBUG),
+            LogLevel::Info => Some(Level::INFO),
+            LogLevel::Warn => Some(Level::WARN),
+            LogLevel::Error => Some(Level::ERROR),
+            LogLevel::Off => None,
+        }
+    }
+}
+
+impl LogLevel {
+    fn modify(self, modifier: i8) -> Self {
+        let level = self as u8;
+        let modified_level = level
+            .saturating_add_signed(modifier)
+            .min(LogLevel::Off as u8);
+
+        modified_level.try_into().unwrap()
     }
 }
 
@@ -217,13 +331,8 @@ fn map_port(cli: &Cli, map_port_args: &MapPortArgs) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::fmt()
-        .with_span_events(FmtSpan::FULL)
-        .with_max_level(Level::TRACE)
-        .compact()
-        .init();
-
     let cli = Cli::parse();
+    cli.configure_logging();
     match &cli.command {
         Commands::ExternalAddress => external_address(&cli),
         Commands::MapPort(map_port_args) => map_port(&cli, map_port_args),
